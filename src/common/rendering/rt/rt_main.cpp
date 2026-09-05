@@ -1540,7 +1540,7 @@ private:
         {
             return t;
         }
-        return std::powf( t, cvar::rt_lightlevel_exp );
+        return std::pow( t, cvar::rt_lightlevel_exp );
     }
 
     auto MakeFirstPersonQuadInWorldSpace( std::span< const RgPrimitiveVertex > verts )

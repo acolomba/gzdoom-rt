@@ -1,53 +1,114 @@
-name: Continuous Integration
+name: AppImage
 
-on: [push, pull_request]
+on:
+  pull_request:
+    paths:
+      - AppImageBuilder.yml
+      - .github/workflows/appimage.yml
+      - tools/appimage/**
+      - CMakeLists.txt
+      - src/**
+      - libraries/RTGL
+      - libraries/ZMusic
+  push:
+    branches: [linux-port]
+    paths:
+      - AppImageBuilder.yml
+      - .github/workflows/appimage.yml
+      - tools/appimage/**
+      - CMakeLists.txt
+      - src/**
+      - libraries/RTGL
+      - libraries/ZMusic
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build-appimage:
-    name: Linux Clang 12 | AppImage
-    runs-on: ubuntu-latest
+    name: Build Linux RT AppImage
+    runs-on: ubuntu-24.04
+    env:
+      # Set these repository variables to a release rt/ archive and its checksum.
+      # The archive must contain rt/data/textures.json (possibly below one directory).
+      RT_ASSETS_URL: ${{ vars.RT_ASSETS_URL }}
+      RT_ASSETS_SHA256: ${{ vars.RT_ASSETS_SHA256 }}
+      # Optional: supplying the DLSS SDK archive enables native DLSS in RTGL.
+      DLSS_SDK_URL: ${{ vars.DLSS_SDK_URL }}
+      DLSS_SDK_SHA256: ${{ vars.DLSS_SDK_SHA256 }}
 
     steps:
-      - uses: actions/checkout@v3
-      - name: Install GZDoom dependencies
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build and AppImage dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install clang-12 libsdl2-dev libvpx-dev libwebp-dev cmake -y
-      - name: Install appimage-builder dependencies
+          sudo apt-get install -y \
+            binutils clang cmake coreutils curl desktop-file-utils fakeroot file fuse \
+            libgl1-mesa-dev libopenal-dev libsndfile1-dev libsdl2-dev libvpx-dev \
+            libwebp-dev libx11-dev patchelf pkg-config python3-pip \
+            python3-setuptools squashfs-tools strace util-linux \
+            libvulkan-dev glslc imagemagick ninja-build unzip
+          # Ubuntu 24.04's system Python is externally managed (PEP 668).
+          # packaging >= 22 removed the legacy version parsing that
+          # appimage-builder 1.1.0 needs for Debian package versions.
+          python3 -m pip install --user --break-system-packages appimage-builder 'packaging==21.3'
+
+      - name: Fetch RT assets
         run: |
-          sudo apt-get install binutils coreutils desktop-file-utils fakeroot fuse libgdk-pixbuf2.0-dev patchelf -y 
-          sudo apt-get install python3-pip python3-setuptools squashfs-tools strace util-linux zsync -y 
-          sudo apt-get install imagemagick-6.q16hdri -y
-      - name: Install appimage-builder
+          test -n "$RT_ASSETS_URL" || {
+            echo "RT_ASSETS_URL repository variable is required for a self-contained AppImage." >&2
+            exit 1
+          }
+          mkdir -p release-input/assets
+          curl --fail --location --retry 3 "$RT_ASSETS_URL" --output release-input/rt-assets.archive
+          if [ -n "$RT_ASSETS_SHA256" ]; then
+            echo "$RT_ASSETS_SHA256  release-input/rt-assets.archive" | sha256sum --check --strict
+          fi
+          # The upstream gzdoom-rt release publishes a zip; a tar works as well.
+          if file release-input/rt-assets.archive | grep -qi 'zip archive'; then
+            unzip -q release-input/rt-assets.archive -d release-input/assets
+          else
+            tar --extract --file release-input/rt-assets.archive --directory release-input/assets
+          fi
+          rt_asset_dir="$(find release-input/assets -type f -path '*/data/textures.json' -printf '%h\n' | sed 's#/data$##' | head -n 1)"
+          test -n "$rt_asset_dir" || { echo "RT asset archive does not contain rt/data/textures.json." >&2; exit 1; }
+          printf 'RT_ASSET_DIR=%s\n' "$PWD/$rt_asset_dir" >> "$GITHUB_ENV"
+
+      - name: Fetch optional DLSS SDK
+        if: env.DLSS_SDK_URL != ''
         run: |
-          python3 -m pip install --upgrade pip
-          pip install appimage-builder
-      - name: Build zmusic dependency
-        run: |
-          git clone -b 1.1.12 https://github.com/ZDoom/ZMusic.git zmusic_build
-          mkdir ./zmusic_build/build
-          cd ./zmusic_build/build
-          cmake -DCMAKE_BUILD_TYPE=Release ..
-          cmake --build .
-          cd ../../
-          mkdir -p ./AppDir/zmusic/lib
-          mkdir ./AppDir/zmusic/include
-          mv ./zmusic_build/build/source/libzmusic* ./AppDir/zmusic/lib/
-          mv ./zmusic_build/include/zmusic.h ./AppDir/zmusic/include/
-      - name: Configure
-        run: cmake -B AppDir -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_PREFIX_PATH=`pwd`/AppDir/zmusic -DPK3_QUIET_ZIPDIR=ON -DCMAKE_C_COMPILER=clang-12 -DCMAKE_CXX_COMPILER=clang++-12 .
-      - name: Build
-        shell: bash
-        run: |
-          export MAKEFLAGS=--keep-going
-          cmake --build AppDir --config Release --parallel `nproc`
-          cp ./AppDir/zmusic/lib/* ./AppDir/
-          mkdir -p ./AppDir/usr/share/icons
-          convert ./src/win32/icon1.ico[0] -flatten ./AppDir/usr/share/icons/game_icon.png
+          mkdir -p release-input/dlss
+          curl --fail --location --retry 3 "$DLSS_SDK_URL" --output release-input/dlss-sdk.tar
+          if [ -n "$DLSS_SDK_SHA256" ]; then
+            echo "$DLSS_SDK_SHA256  release-input/dlss-sdk.tar" | sha256sum --check --strict
+          fi
+          tar --extract --file release-input/dlss-sdk.tar --directory release-input/dlss
+          dlss_sdk_dir="$(find release-input/dlss -type f -path '*/include/nvsdk_ngx.h' -printf '%h\n' | sed 's#/include$##' | head -n 1)"
+          test -n "$dlss_sdk_dir" || { echo "DLSS SDK archive has no include/nvsdk_ngx.h." >&2; exit 1; }
+          printf 'DLSS_SDK_PATH=%s\n' "$PWD/$dlss_sdk_dir" >> "$GITHUB_ENV"
+
       - name: Build AppImage
         run: |
-          appimage-builder --skip-tests
-      - uses: actions/upload-artifact@v2
+          version="${{ github.event.release.tag_name || github.ref_name }}"
+          CC=clang CXX=clang++ \
+          GZDOOM_RT_ASSET_DIR="$RT_ASSET_DIR" \
+          GZDOOM_RT_DLSS_SDK_DIR="${DLSS_SDK_PATH:-}" \
+          tools/appimage/build-appimage.sh "$version"
+
+      - uses: actions/upload-artifact@v4
         with:
-          name: AppImage
-          path: './*.AppImage*'
+          name: GZDoom-RT-AppImage
+          path: dist/*.AppImage
+          if-no-files-found: error
+
+      - name: Attach AppImage to the GitHub Release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name }}" dist/*.AppImage --clobber
