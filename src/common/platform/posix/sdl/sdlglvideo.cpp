@@ -132,6 +132,34 @@ namespace Priv
 	bool softpolyEnabled;
 	bool fullscreenSwitch;
 
+#if HAVE_RT
+	// RTGL sizes its output from the window surface. Fullscreen should use
+	// the selected window resolution; desktop fullscreen uses the desktop size.
+	// SDL selects the fullscreen display mode from the window dimensions.
+	const uint32_t fullscreenFlag = SDL_WINDOW_FULLSCREEN;
+#else
+	const uint32_t fullscreenFlag = SDL_WINDOW_FULLSCREEN_DESKTOP;
+#endif
+
+	void SetFullscreen(bool enable)
+	{
+		if (SDL_SetWindowFullscreen(window, enable ? fullscreenFlag : 0) == 0)
+			return;
+
+		Printf(TEXTCOLOR_YELLOW "Fullscreen mode change failed: %s\n", SDL_GetError());
+#if HAVE_RT
+		// Exclusive fullscreen can perform a real display-mode switch, which
+		// can be refused; keep the game usable at the desktop resolution instead.
+		if (enable)
+		{
+			if (SDL_SetWindowFullscreen(window, SDL_WINDOW_FULLSCREEN_DESKTOP) == 0)
+				Printf(TEXTCOLOR_YELLOW "Falling back to desktop fullscreen.\n");
+			else
+				Printf(TEXTCOLOR_YELLOW "Desktop fullscreen also failed: %s; staying windowed.\n", SDL_GetError());
+		}
+#endif
+	}
+
 	void CreateWindow(uint32_t extraFlags)
 	{
 		assert(Priv::window == nullptr);
@@ -264,7 +292,7 @@ SDLVideo::SDLVideo ()
 
 	if (Priv::vulkanEnabled)
 	{
-		Priv::CreateWindow(SDL_WINDOW_VULKAN | SDL_WINDOW_HIDDEN | (vid_fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0));
+		Priv::CreateWindow(SDL_WINDOW_VULKAN | SDL_WINDOW_HIDDEN | (vid_fullscreen ? Priv::fullscreenFlag : 0));
 
 		if (Priv::window == nullptr)
 		{
@@ -295,7 +323,7 @@ DFrameBuffer *SDLVideo::CreateFrameBuffer ()
 #if HAVE_RT
 	if (Priv::window == nullptr)
 	{
-		Priv::CreateWindow(SDL_WINDOW_HIDDEN | (vid_fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0));
+		Priv::CreateWindow(SDL_WINDOW_HIDDEN | (vid_fullscreen ? Priv::fullscreenFlag : 0));
 	}
 	if (Priv::window == nullptr)
 	{
@@ -379,7 +407,7 @@ SystemBaseFrameBuffer::SystemBaseFrameBuffer (void *, bool fullscreen)
 {
 	if (Priv::window != nullptr)
 	{
-		SDL_SetWindowFullscreen(Priv::window, fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+		Priv::SetFullscreen(fullscreen);
 		SDL_ShowWindow(Priv::window);
 	}
 }
@@ -427,7 +455,7 @@ bool SystemBaseFrameBuffer::IsFullscreen ()
 
 void SystemBaseFrameBuffer::ToggleFullscreen(bool yes)
 {
-	SDL_SetWindowFullscreen(Priv::window, yes ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+	Priv::SetFullscreen(yes);
 	if ( !yes )
 	{
 		if ( !Priv::fullscreenSwitch )
