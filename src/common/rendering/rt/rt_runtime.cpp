@@ -318,16 +318,49 @@ bool BasicPrepareRuntime(const fs::path& source, const fs::path& runtime)
     return ValidRuntime(runtime);
 }
 
+fs::path ManifestSource(const fs::path& runtime)
+{
+    std::ifstream in(runtime / ".gzdoom-rt-runtime");
+    std::string line;
+    while (in && std::getline(in, line))
+    {
+        constexpr std::string_view prefix = "source=";
+        if (line.rfind(prefix, 0) == 0)
+        {
+            return fs::path(line.substr(prefix.size()));
+        }
+    }
+    return {};
+}
+
+bool SamePath(const fs::path& a, const fs::path& b)
+{
+    std::error_code ec;
+    fs::path ca = fs::weakly_canonical(a, ec);
+    fs::path cb = fs::weakly_canonical(b, ec);
+    return !ca.empty() && ca == cb;
+}
+
 fs::path PrepareOrFallback()
 {
-    fs::path runtime = PreferredRuntimePath();
-    if (ValidRuntime(runtime) && RuntimeCompatCurrent(runtime))
+    fs::path source = FindAssetSource();
+
+    if (fs::path runtime = PreferredRuntimePath();
+        ValidRuntime(runtime) && RuntimeCompatCurrent(runtime))
     {
-        g_runtimeSource = "prepared-runtime";
-        return runtime;
+        // A prepared runtime is only trusted for the source it was prepared
+        // from. Without this, a runtime cached for one game shadows a freshly
+        // pointed GZDOOM_RT_ASSET_DIR of another (Doom64-RT vs gzdoom-rt) and
+        // the wrong rt/wad loads with nothing in the log but a lump count.
+        if (source.empty() || SamePath(runtime, source) || SamePath(ManifestSource(runtime), source))
+        {
+            g_runtimeSource = "prepared-runtime";
+            return runtime;
+        }
+        g_runtimeSource = "reprepare-source-changed";
     }
 
-    fs::path source = FindAssetSource();
+    fs::path runtime = PreferredRuntimePath();
     if (source.empty())
     {
         if (ValidRuntime("rt"))
