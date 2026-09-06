@@ -143,6 +143,19 @@ namespace Priv
 
 	void SetFullscreen(bool enable)
 	{
+#if HAVE_RT
+		if (enable)
+		{
+			// Ask for the mode matching the selected resolution, not whatever
+			// size the window happens to have; SDL applies this immediately
+			// when the window is already in exclusive fullscreen.
+			SDL_DisplayMode mode = {};
+			mode.w = win_w;
+			mode.h = win_h;
+			if (SDL_SetWindowDisplayMode(window, &mode) != 0)
+				Printf(TEXTCOLOR_YELLOW "Setting fullscreen display mode %dx%d failed: %s\n", (int)win_w, (int)win_h, SDL_GetError());
+		}
+#endif
 		if (SDL_SetWindowFullscreen(window, enable ? fullscreenFlag : 0) == 0)
 			return;
 

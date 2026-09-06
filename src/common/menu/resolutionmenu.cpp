@@ -80,6 +80,14 @@ CCMD (menu_resolution_commit_changes)
 	}
 	else
 	{
+#if HAVE_RT && !defined(_WIN32)
+		// Exclusive fullscreen derives its display mode from win_w/win_h
+		// (see Priv::SetFullscreen in the SDL backend); route the selected
+		// resolution there and force a mode update even if already fullscreen.
+		win_w = menu_resolution_custom_width;
+		win_h = menu_resolution_custom_height;
+		setmodeneeded = true;
+#endif
 		vid_fullscreen = true;
 		vid_scalemode = 0;
 		vid_scalefactor = 1.;

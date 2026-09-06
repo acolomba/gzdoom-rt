@@ -1425,11 +1425,15 @@ DEFINE_ACTION_FUNCTION(DListMenuItemTextItem_RT, ApplyResolution)
 	const auto [width_fs, height_fs] = GetFullscreen();
 	fullscreen = fullscreen || (width == width_fs && height == height_fs);
 
+#ifdef _WIN32
+    // Fullscreen always renders at the desktop resolution on Windows; the
+    // SDL backend instead switches to an exclusive mode at the selected size.
     if (fullscreen)
     {
 		width = width_fs;
 		height = height_fs;
     }
+#endif
 
     menu_resolution_custom_width = std::max(200, width);
     menu_resolution_custom_height = std::max(200, height);
@@ -2003,8 +2007,10 @@ static std::pair< int, int > GetFullscreen()
         GetSystemMetrics( SM_CYSCREEN ),
     };
 #else
+    // Desktop mode, not current: once exclusive fullscreen lowers the display
+    // mode, the current mode would misreport the screen's real size.
     SDL_DisplayMode mode = {};
-    if( SDL_WasInit( SDL_INIT_VIDEO ) && SDL_GetCurrentDisplayMode( 0, &mode ) == 0 )
+    if( SDL_WasInit( SDL_INIT_VIDEO ) && SDL_GetDesktopDisplayMode( 0, &mode ) == 0 )
     {
         return { mode.w, mode.h };
     }
