@@ -66,7 +66,7 @@
 
 //-----------------------------------------------------------------------------
 //
-// Shamelessly lifted from Doomsday (written by Jaakko Keränen)
+// Shamelessly lifted from Doomsday (written by Jaakko Kerï¿½nen)
 // also shamelessly lifted from ZDoomGL! ;)
 //
 //-----------------------------------------------------------------------------
@@ -393,6 +393,117 @@ void FSkyVertexBuffer::CreateDome()
 	ptr[35].SetXYZ(-128.f, 128.f, -128.f, 1, 1);
 	ptr[36].SetXYZ(128.f, 128.f, 128.f, 0, 0);
 	ptr[37].SetXYZ(-128.f, 128.f, 128.f, 1, 0);
+
+#if HAVE_RT
+	// Doom64-RT: a unit quad for the moon, in THIS buffer rather than the
+	// per-frame one.
+	//
+	// screen->mVertexData cannot be used from a portal's DrawContents: its
+	// GetBuffer() returns mVertexBuffer->Memory(), which is null unless the
+	// buffer is currently mapped, and portals draw at a stage where it is not --
+	// so allocating there dereferences null and takes the game down on startup.
+	// Mapping it by hand is worse, not better: it is mapped for the whole frame
+	// elsewhere, and unmapping mid-render invalidates every later draw, which
+	// shows up as a flat grey washed-out scene rather than as a crash.
+	//
+	// This buffer is built once and stays valid, so the moon rides it and is
+	// positioned by a model matrix instead. Corners are +/-1 in x/y at z=0; the
+	// matrix supplies the basis, the size and the distance.
+	mMoonStart = mVertices.Size();
+	mVertices.Reserve(4);
+	FSkyVertex* mp = &mVertices[mMoonStart];
+	mp[0].SetXYZ(-1.f,  1.f, 0.f, 0, 0);
+	mp[1].SetXYZ( 1.f,  1.f, 0.f, 1, 0);
+	mp[2].SetXYZ(-1.f, -1.f, 0.f, 0, 1);
+	mp[3].SetXYZ( 1.f, -1.f, 0.f, 1, 1);
+
+	// Doom64-RT: the cloud deck. A horizontal disc of unit radius, in the same
+	// static buffer and for the same reason.
+	//
+	// A DISC, NOT A DOME. The clouds used to be drawn on the sky dome itself,
+	// which is the one thing a cloud layer must not be: a dome layer rotates
+	// about the viewer, so the clouds visibly orbit and come round again. A
+	// horizontal deck scrolls its texture along a fixed wind vector instead, so
+	// the motion is linear and never repeats a lap -- and perspective then does
+	// the rest for free, crowding distant clouds toward the horizon the way a
+	// real overcast does. The engine draws this disc once per shell at a
+	// different altitude, and the shells parallax against each other because
+	// they genuinely are at different heights.
+	//
+	// Geometry, in mesh units (the model matrix supplies real scale):
+	//   x,z  = f*cos(t), f*sin(t)   with f the radial fraction 0..1
+	//   y    = -f*f                 a shallow BOWL, so the rim bends down toward
+	//                               the horizon instead of running out to a hard
+	//                               flat edge hanging in mid-air
+	//   u,v  = x,z                  world-planar, so the texture tiles across the
+	//                               deck and a translation of (u,v) IS wind
+	//
+	// Alpha is baked per VERTEX -- radial fade to nothing at the rim. It has to
+	// be per-vertex: this buffer declares VATTR_COLOR, so the Vulkan pipeline
+	// sets UseVertexData and main.vp takes vColor from aColor, ignoring
+	// uVertexColor entirely (state.SetColor does nothing here). Per-shell
+	// brightness and opacity therefore go through SetObjectColor instead, which
+	// is a separate uniform and multiplies the texel including its alpha.
+	//
+	// The fade is what keeps the deck from ending in a visible edge: without it
+	// the last ring is a hard line across the sky at the rim altitude.
+	{
+		const int   RINGS   = 20;
+		const int   SECTORS = 48;
+
+		mCloudStart = mVertices.Size();
+
+		auto ringf = [&](int i) {
+			// Slightly denser toward the rim, where both the bowl curvature and
+			// the alpha fade change fastest.
+			return powf(float(i) / float(RINGS), 0.85f);
+		};
+		auto vert = [&](int ring, int col) {
+			const float f = ringf(ring);
+			const FAngle a = FAngle::fromDeg(col * 360.f / float(SECTORS));
+			const float x = f * a.Cos();
+			const float z = f * a.Sin();
+
+			// smoothstep(0.45, 1, f), inverted
+			float t = clamp((f - 0.45f) / 0.55f, 0.f, 1.f);
+			t = t * t * (3.f - 2.f * t);
+			const int alpha = int(255.f * (1.f - t) + 0.5f);
+
+			FSkyVertex v;
+			// SetXYZ, NOT Set. Set's parameters are named (xx, zz, yy) and it
+			// assigns z from the second and y from the third -- so Set() would
+			// put the bowl offset into a horizontal axis and the disc's z into
+			// the height. SetXYZ is positional (x, y, z) with height in the
+			// middle, which is the convention SkyVertexDoom and the moon quad
+			// both use.
+			v.SetXYZ(x, -f * f, z, x, z, PalEntry(alpha, 255, 255, 255));
+			mVertices.Push(v);
+		};
+
+		// One triangle strip for the whole disc, ring pairs joined by degenerate
+		// triangles. One draw call per shell rather than one per ring, which
+		// matters more than usual here: every sky primitive is re-submitted to
+		// RTGL1 and re-rasterised into all six cubemap faces every frame.
+		for (int r = 0; r < RINGS; r++)
+		{
+			if (r > 0)
+			{
+				// Degenerates: repeat the last vertex, then the first of the new
+				// strip. Winding parity is not preserved and does not need to be
+				// -- the sky is drawn without face culling.
+				const FSkyVertex last = mVertices.Last();
+				mVertices.Push(last);
+				vert(r, 0);
+			}
+			for (int c = 0; c <= SECTORS; c++)
+			{
+				vert(r, c);
+				vert(r + 1, c);
+			}
+		}
+		mCloudCount = mVertices.Size() - mCloudStart;
+	}
+#endif
 }
 
 //-----------------------------------------------------------------------------

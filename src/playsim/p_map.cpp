@@ -105,6 +105,87 @@ static constexpr int RT_BLOOD_REPL_DEFAULT = 0;
 static constexpr int RT_BLOOD_REPL_DEFAULT = 2;
 #endif
 CVARD( Int, rt_blood_repl, RT_BLOOD_REPL_DEFAULT, CVAR_ARCHIVE, "0: disable gzdoom blood decal and spawn fluid at its place.  1: fluid and decal.  2: only decal (gzdoom default).  Requires cl_bloodsplats=1" )
+
+// Impact sparks (rt_sparks.cpp). Declared here rather than in a header for the
+// same reason RT_SpawnFluid is declared inside p_mobj.cpp: rt_internal.h is not a
+// public header and nothing outside common/rendering/rt may include it, so the
+// renderer's playsim-facing entry points live at global scope and are named where
+// they are used.
+//
+// The hitscan impact point is only knowable HERE. P_SpawnPuff, one level down,
+// gets a yaw and an updown int, which is why the blood spawner beside it has to
+// approximate a normal; in this function the whole FTraceResults is still in
+// scope, so sparks get a true surface normal and can reflect properly.
+extern void RT_SpawnImpactSparks( const DVector3& pos,
+                                  const FVector3& normal,
+                                  const FVector3& indir,
+                                  sector_t*       sec,
+                                  FTextureID      hitTexture,
+                                  int             liquidId );
+
+// WHICH liquid is this surface? -1 none, else 0 water / 1 nukage / 2 sludge /
+// 3 blood (rt_spark_surfaces.cpp). Lava and the sky are deliberately NOT in it.
+extern int RT_LiquidSplashId( FTextureID hitTexture );
+
+// Defined in rt_cvars.inc with every other rt_* cvar, and reached the way
+// p_mobj.cpp reaches rt_fluid. It belongs there rather than here so that
+// check_pins.py can see it: that tool reads the X-macro list, and a pin naming a
+// cvar it cannot find is reported as pinning nothing at all.
+namespace cvar
+{
+EXTERN_CVAR( Bool, rt_liquid_nopuff );
+}
+
+// The texture the shot actually landed on.
+//
+// trace.HitTexture IS NOT FILLED IN FOR WALLS, and that is not an oversight to
+// work around quietly -- it is where the wall texture comes from at all. Core
+// Trace() sets HitTexture for floors and ceilings only; the WALL case is patched
+// in by DLineTracer::TraceCallback (p_trace.cpp), which belongs to the ZScript
+// LineTracer class and never runs for P_LineAttack. So a hitscan into a wall
+// arrives with an invalid FTextureID, every surface resolves to an empty name,
+// and the whole classification silently reports "unlisted" for the entire game.
+//
+// This mirrors that callback's tier logic rather than calling it, because it is a
+// DObject method on a class this path has nothing to do with.
+//
+// It is a FUNCTION rather than a block inside the sparks hook because two things
+// now need the answer and they run at different points: the puff decision, which
+// happens BEFORE the puff is spawned, and the impact hook, which happens after.
+// Two copies of a tier walk is exactly how they drift apart.
+static FTextureID RT_HitTextureOf(const FTraceResults &trace)
+{
+	FTextureID hitTex = trace.HitTexture;
+	if (trace.HitType == TRACE_HitWall && trace.Line != nullptr
+		&& trace.Line->sidedef[trace.Side] != nullptr)
+	{
+		// textures[]: 0 = top, 1 = mid, 2 = bottom.
+		int txpart = 1;
+		switch (trace.Tier)
+		{
+		case TIER_Upper:  txpart = 0; break;
+		case TIER_Lower:  txpart = 2; break;
+		case TIER_FFloor:
+			txpart = (trace.ffloor && (trace.ffloor->flags & FF_UPPERTEXTURE)) ? 0
+				   : (trace.ffloor && (trace.ffloor->flags & FF_LOWERTEXTURE)) ? 2
+				   : 1;
+			break;
+		default:          txpart = 1; break;
+		}
+
+		if (trace.Tier == TIER_FFloor && trace.ffloor != nullptr
+			&& trace.ffloor->master != nullptr
+			&& trace.ffloor->master->sidedef[0] != nullptr)
+		{
+			hitTex = trace.ffloor->master->sidedef[0]->textures[txpart].texture;
+		}
+		else
+		{
+			hitTex = trace.Line->sidedef[trace.Side]->textures[txpart].texture;
+		}
+	}
+	return hitTex;
+}
 #endif
 
 static void CheckForPushSpecial(line_t *line, int side, AActor *mobj, DVector2 * posforwindowcheck = NULL);
@@ -4757,8 +4838,24 @@ AActor *P_LineAttack(AActor *t1, DAngle angle, double distance,
 			P_GeometryLineAttack(trace, t1, damage, damageType);
 			if (victim != NULL) victim->unlinked = trace.unlinked;
 
+#if HAVE_RT
+			// WHICH LIQUID -- resolved ONCE for this hit and used twice: here, to
+			// suppress the vanilla puff, and below, to let the impact hook past the
+			// terrain gate. The two decisions must agree, or a surface loses its puff
+			// and gets nothing in return.
+			//
+			// A bullet into water throws a splash, not a puff of smoke. nointeract is
+			// excluded because it GUARANTEES a puff and returns it to the caller --
+			// that path is an aiming probe, not a visible impact.
+			const FTextureID rtHitTex   = RT_HitTextureOf(trace);
+			const int        rtLiquidId = RT_LiquidSplashId(rtHitTex);
+			const bool       rtNoPuff   = (rtLiquidId >= 0) && cvar::rt_liquid_nopuff && !nointeract;
+#else
+			constexpr bool   rtNoPuff   = false;
+#endif
+
 			// position a bit closer for puffs
-			if (nointeract || trace.HitType != TRACE_HitWall || ((trace.Line->special != Line_Horizon) || spawnSky))
+			if (!rtNoPuff && (nointeract || trace.HitType != TRACE_HitWall || ((trace.Line->special != Line_Horizon) || spawnSky)))
 			{
 				DVector2 pos = t1->Level->GetPortalOffsetPosition(trace.HitPos.X, trace.HitPos.Y, -trace.HitVector.X * 4, -trace.HitVector.Y * 4);
 				puff = P_SpawnPuff(t1, pufftype, DVector3(pos, trace.HitPos.Z - trace.HitVector.Z * 4), trace.SrcAngleFromTarget,
@@ -4770,6 +4867,88 @@ AActor *P_LineAttack(AActor *t1, DAngle angle, double distance,
 					return puff;
 				}
 			}
+
+#if HAVE_RT
+			// IMPACT SPARKS. This branch is the non-actor half of the trace, i.e.
+			// the shot hit the WORLD -- flesh is handled further down and is
+			// deliberately excluded, because blood already owns it.
+			//
+			// Read-only: `trace` and the level geometry, nothing else. No RNG is
+			// consumed and no playsim state is written, because doing either from
+			// a renderer feature desyncs demos and netgames invisibly. The renderer
+			// side keeps its own private xorshift for exactly this reason.
+			if (!nointeract && !(puffFlags & PF_HITSKY) && trace.HitType != TRACE_HasHitSky)
+			{
+				bool sparkOK = true;
+
+				// Liquids get no SPARKS: a hot fragment bouncing off a slime pool reads
+				// wrong. But a bullet into nukage is a SPLASH, and this gate used to
+				// refuse that too -- RT_SpawnImpactSparks was never reached on a liquid
+				// floor, so the fluid class could only ever fire on the wall falls and
+				// shooting water produced nothing at all.
+				//
+				// The four liquids we splash now go THROUGH, classified by texture name,
+				// which is the only thing that can tell water from lava. Everything else
+				// this lump calls liquid is still refused -- lava, which keeps the puff
+				// and the silence it shipped with, and F_SKY1, which Retribution's
+				// TERRAIN also marks `liquid`. Do not simplify this to deleting the gate.
+				if (rtLiquidId < 0 && trace.Sector != nullptr && trace.HitType != TRACE_HitWall)
+				{
+					const auto plane = trace.HitType == TRACE_HitCeiling ? sector_t::ceiling : sector_t::floor;
+					if (Terrains[trace.Sector->GetTerrain(plane)].IsLiquid)
+					{
+						sparkOK = false;
+					}
+				}
+
+				if (sparkOK)
+				{
+					// A TRUE surface normal, which is the whole reason this hook is
+					// here and not in P_SpawnPuff. A linedef runs v1->v2 with its
+					// front to the right, so the wall normal is the perpendicular of
+					// its delta, flipped when the back side was hit; a flat's normal
+					// is simply up or down.
+					FVector3 nrm;
+					if (trace.HitType == TRACE_HitWall && trace.Line != nullptr)
+					{
+						const DVector2 d = trace.Line->Delta();
+						nrm = FVector3(float(d.Y), float(-d.X), 0.f);
+						if (nrm.LengthSquared() > 1e-8f)
+						{
+							nrm.MakeUnit();
+						}
+						else
+						{
+							nrm = FVector3(0.f, 0.f, 1.f);
+						}
+						if (trace.Side != 0)
+						{
+							nrm = -nrm;
+						}
+					}
+					else
+					{
+						nrm = FVector3(0.f, 0.f, trace.HitType == TRACE_HitCeiling ? -1.f : 1.f);
+					}
+
+					FVector3 indir(float(trace.HitVector.X), float(trace.HitVector.Y), float(trace.HitVector.Z));
+					if (indir.LengthSquared() > 1e-8f)
+					{
+						indir.MakeUnit();
+					}
+
+					// However the geometry is wound, the normal must face back
+					// along the shot -- otherwise the reflection sends the sparks
+					// INTO the wall.
+					if ((indir | nrm) > 0.f)
+					{
+						nrm = -nrm;
+					}
+
+					RT_SpawnImpactSparks(trace.HitPos, nrm, indir, trace.Sector, rtHitTex, rtLiquidId);
+				}
+			}
+#endif
 
 			// [RH] Spawn a decal
 			if (trace.HitType == TRACE_HitWall && trace.Line->special != Line_Horizon && !trace.Line->isVisualPortal() && !(flags & LAF_NOIMPACTDECAL) && !(puffDefaults->flags7 & MF7_NODECAL))

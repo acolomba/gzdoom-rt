@@ -46,6 +46,11 @@
 
 #ifdef ARCH_IA32
 #include <immintrin.h>
+#if HAVE_RT && defined(_WIN32)
+#include <chrono>
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h> // SleepEx, for the alertable worker wait below
+#endif
 #endif // ARCH_IA32
 
 CVAR(Bool, gl_multithread, true, CVAR_ARCHIVE | CVAR_GLOBALCONFIG)
@@ -266,6 +271,12 @@ static bool RT_CanOmitUploadOfStaticExportable( const seg_t* seg )
 	// if using classic mode, we must upload visible surfaces,
 	// even static exportables, since classic doesn't draw baked static geometry
 	if( cvar::rt_classic > 0.001f )
+	{
+		return false;
+	}
+	// Doom64-RT: with rt_classic=0, stock code skips ExportMap walls/flats assuming
+	// baked rt/scenes geometry. Mod maps have no scenes → walls never upload → sky holes.
+	if( RT_ModMapNeedsLiveGeometryUpload() )
 	{
 		return false;
 	}
@@ -987,6 +998,51 @@ void HWDrawInfo::RenderBSPNode (void *node)
 
 			const auto viewbox = FBoundingBox( Viewpoint.Pos.X, Viewpoint.Pos.Y, nocullradius );
 
+			// Doom64-RT: "does this candidate share a two-sided seg with an
+			// already-visible sector?" used to be answered by scanning EVERY seg
+			// in the level, inside the loop over every sector -- O(sectors x segs)
+			// every frame. On MAP34 (706 sectors, ~20k segs) that measured 3.8 ms
+			// of a ~6 ms frame, the single largest CPU item in the game.
+			//
+			// The same question can be answered for ALL sectors in one pass over
+			// the segs, because it is a property of the seg, not of the candidate.
+			// Same predicate, same result, same visible set -- see the equivalence
+			// note at the test below.
+			static auto rt_adjtovisible = std::vector< bool >{};
+			rt_adjtovisible.resize( Level->sectors.size() );
+			rt_adjtovisible.assign( rt_adjtovisible.size(), false );
+
+			// Skipped entirely when the switch is off, so rt_cull_hoist 0 costs
+			// exactly what the original code cost and the A/B is honest.
+			if( cvar::rt_cull_hoist )
+			for( const seg_t& seg : Level->segs )
+			{
+				int fs = ( seg.frontsector && seg.frontsector->sectornum >= 0 &&
+				           seg.frontsector->sectornum < int( rt_sectorvis.size() ) )
+				             ? seg.frontsector->sectornum
+				             : -1;
+				int bs = ( seg.backsector && seg.backsector->sectornum >= 0 &&
+				           seg.backsector->sectornum < int( rt_sectorvis.size() ) )
+				             ? seg.backsector->sectornum
+				             : -1;
+
+				// Both sides required, exactly as the old inner loop demanded:
+				// it `continue`d on fs < 0 and again on bs < 0 before testing.
+				if( fs < 0 || bs < 0 )
+				{
+					continue;
+				}
+
+				if( rt_sectorvis[ fs ] )
+				{
+					rt_adjtovisible[ bs ] = true;
+				}
+				if( rt_sectorvis[ bs ] )
+				{
+					rt_adjtovisible[ fs ] = true;
+				}
+			}
+
 			sectorvis_expanded.assign( sectorvis_expanded.size(), false );
 			for( const sector_t& candidate : Level->sectors )
 			{
@@ -999,6 +1055,21 @@ void HWDrawInfo::RenderBSPNode (void *node)
 				if( rt_sectorvis[ candidate.sectornum ] )
 				{
 					sectorvis_expanded[ candidate.sectornum ] = true;
+					continue;
+				}
+
+				// EQUIVALENCE. The old code marked the candidate when some seg had
+				// both sectors valid and (candidate == fs && vis[bs]) ||
+				// (candidate == bs && vis[fs]). rt_adjtovisible[candidate] is true
+				// under exactly that condition, so this test and the seg scan it
+				// replaces accept the same sectors.
+				//
+				// It is tested BEFORE the bounding-box walk on purpose: the two are
+				// a conjunction, so the order cannot change the outcome, and this
+				// one is a single array read where the other walks every line of
+				// the sector.
+				if( cvar::rt_cull_hoist && !rt_adjtovisible[ candidate.sectornum ] )
+				{
 					continue;
 				}
 
@@ -1016,34 +1087,101 @@ void HWDrawInfo::RenderBSPNode (void *node)
 				{
 					continue;
 				}
-				for( seg_t& seg : Level->segs )
+
+				// rt_cull_hoist 0 restores the original inner scan, so the cost
+				// of the thing that was removed can be measured in this build
+				// rather than by rebuilding at an older commit.
+				if( !cvar::rt_cull_hoist )
 				{
-					int fs = ( seg.frontsector && seg.frontsector->sectornum >= 0 &&
-					           seg.frontsector->sectornum < int( rt_sectorvis.size() ) )
-					             ? seg.frontsector->sectornum
-					             : -1;
-					if( fs < 0 )
+					bool adjacent = false;
+					for( seg_t& seg : Level->segs )
+					{
+						int fs = ( seg.frontsector && seg.frontsector->sectornum >= 0 &&
+						           seg.frontsector->sectornum < int( rt_sectorvis.size() ) )
+						             ? seg.frontsector->sectornum
+						             : -1;
+						if( fs < 0 ) continue;
+						int bs = ( seg.backsector && seg.backsector->sectornum >= 0 &&
+						           seg.backsector->sectornum < int( rt_sectorvis.size() ) )
+						             ? seg.backsector->sectornum
+						             : -1;
+						if( bs < 0 ) continue;
+						if( ( candidate.sectornum == fs && rt_sectorvis[ bs ] ) ||
+						    ( candidate.sectornum == bs && rt_sectorvis[ fs ] ) )
+						{
+							adjacent = true;
+							break;
+						}
+					}
+					if( !adjacent )
+					{
+						continue;
+					}
+				}
+
+				sectorvis_expanded[ candidate.sectornum ] = true;
+			}
+
+			// Doom64-RT: the equivalence above is an argument, so here is the
+			// experiment. rt_cull_verify re-runs the ORIGINAL O(sectors x segs)
+			// predicate and reports any sector the two disagree on. Off by
+			// default and O(T x G) when on -- it is a correctness gate to run
+			// once after touching this, not something to leave enabled.
+			if( cvar::rt_cull_verify )
+			{
+				int mismatches = 0;
+				for( const sector_t& candidate : Level->sectors )
+				{
+					if( rt_sectorvis[ candidate.sectornum ] )
 					{
 						continue;
 					}
 
-					int bs = ( seg.backsector && seg.backsector->sectornum >= 0 &&
-					           seg.backsector->sectornum < int( rt_sectorvis.size() ) )
-					             ? seg.backsector->sectornum
-					             : -1;
-					if( bs < 0 )
+					bool touches = false;
+					for( const line_t* l : candidate.Lines )
 					{
-						continue;
+						if( l && inRange( viewbox, l ) )
+						{
+							touches = true;
+							break;
+						}
 					}
 
-					// 'fs' is a neighbor, and 'fs' is visible => candidate is visible
-					// 'bs' is a neighbor, and 'bs' is visible => candidate is visible
-					if( ( candidate.sectornum == fs && rt_sectorvis[ bs ] ) ||
-					    ( candidate.sectornum == bs && rt_sectorvis[ fs ] ) )
+					bool oldresult = false;
+					if( touches )
 					{
-						sectorvis_expanded[ candidate.sectornum ] = true;
-						break;
+						for( seg_t& seg : Level->segs )
+						{
+							int fs = ( seg.frontsector && seg.frontsector->sectornum >= 0 &&
+							           seg.frontsector->sectornum < int( rt_sectorvis.size() ) )
+							             ? seg.frontsector->sectornum
+							             : -1;
+							if( fs < 0 ) continue;
+							int bs = ( seg.backsector && seg.backsector->sectornum >= 0 &&
+							           seg.backsector->sectornum < int( rt_sectorvis.size() ) )
+							             ? seg.backsector->sectornum
+							             : -1;
+							if( bs < 0 ) continue;
+							if( ( candidate.sectornum == fs && rt_sectorvis[ bs ] ) ||
+							    ( candidate.sectornum == bs && rt_sectorvis[ fs ] ) )
+							{
+								oldresult = true;
+								break;
+							}
+						}
 					}
+
+					if( oldresult != sectorvis_expanded[ candidate.sectornum ] )
+					{
+						mismatches++;
+					}
+				}
+
+				static int s_verifytick = 0;
+				if( ( s_verifytick++ % 35 ) == 0 )
+				{
+					Printf( "rt_cull_verify: %d sector(s) differ from the original predicate\n",
+					        mismatches );
 				}
 			}
 
@@ -1051,7 +1189,89 @@ void HWDrawInfo::RenderBSPNode (void *node)
 		}
 
 
-		// add neighbor sectors
+		// add neighbor sectors -- see rt_cull_neighbor_subsector for why this has
+		// two implementations. The subsector one is the fix; the sector one below
+		// is the original behaviour, kept for A/B.
+		if( cvar::rt_cull_neighbor_subsector )
+		{
+			static auto rt_subsectorvis = std::vector< bool >{};
+			rt_subsectorvis.resize( Level->subsectors.size() );
+			rt_subsectorvis.assign( rt_subsectorvis.size(), false );
+
+			// Seed at the SAME granularity as the base rt_sectorvis pass above
+			// (a directly-drawn seg's own subsector), not the sector it belongs to.
+			for( const seg_t& seg : level.segs )
+			{
+				if( seg.segnum < 0 || seg.segnum >= int( rt_segdrawn.size() ) )
+				{
+					continue;
+				}
+				if( rt_segdrawn[ seg.segnum ] && seg.Subsector )
+				{
+					int ssnum = seg.Subsector->Index();
+					if( ssnum >= 0 && ssnum < int( rt_subsectorvis.size() ) )
+					{
+						rt_subsectorvis[ ssnum ] = true;
+					}
+				}
+			}
+
+			// Also seed whatever the radius shell above folded into rt_sectorvis.
+			// That pass is deliberately sector-granularity -- "everything within N
+			// metres regardless of visibility" has no finer BSP-derived answer to
+			// give -- so every subsector of a radius-included sector seeds here.
+			for( subsector_t& ss : Level->subsectors )
+			{
+				if( ss.sector && ss.sector->sectornum >= 0 &&
+				    ss.sector->sectornum < int( rt_sectorvis.size() ) &&
+				    rt_sectorvis[ ss.sector->sectornum ] )
+				{
+					int ssnum = ss.Index();
+					if( ssnum >= 0 && ssnum < int( rt_subsectorvis.size() ) )
+					{
+						rt_subsectorvis[ ssnum ] = true;
+					}
+				}
+			}
+
+			// One-hop neighbor expansion, scoped to the SPECIFIC subsector on each
+			// side of a seg (its partner's own subsector) instead of every
+			// subsector the far sector happens to own -- this is the fix.
+			static auto rt_subsectorvis_expanded = std::vector< bool >{};
+			rt_subsectorvis_expanded = rt_subsectorvis;
+
+			for( seg_t& seg : Level->segs )
+			{
+				if( !seg.Subsector || !seg.PartnerSeg || !seg.PartnerSeg->Subsector )
+				{
+					continue;
+				}
+				int mine  = seg.Subsector->Index();
+				int other = seg.PartnerSeg->Subsector->Index();
+				if( mine < 0 || mine >= int( rt_subsectorvis.size() ) ||
+				    other < 0 || other >= int( rt_subsectorvis.size() ) )
+				{
+					continue;
+				}
+				if( rt_subsectorvis[ mine ] )
+				{
+					rt_subsectorvis_expanded[ other ] = true;
+				}
+			}
+
+			for( subsector_t& ss : Level->subsectors )
+			{
+				int ssnum = ss.Index();
+				if( ssnum >= 0 && ssnum < int( rt_subsectorvis_expanded.size() ) &&
+				    rt_subsectorvis_expanded[ ssnum ] )
+				{
+					DoSubsector( &ss );
+				}
+			}
+
+			return;
+		}
+
 		sectorvis_expanded.assign( sectorvis_expanded.size(), false );
 		for( seg_t& seg : Level->segs )
 		{
@@ -1179,7 +1399,22 @@ void HWDrawInfo::RenderBSP(void *node, bool drawpsprites)
 		jobQueue.AddJob(RenderJob::TerminateJob, nullptr, nullptr);
 		Bsp.Unclock();
 		MTWait.Clock();
+#if HAVE_RT && defined(_WIN32)
+		// Doom64-RT: a fault on the worker thread is handled by CatchAllExceptions
+		// (i_main.cpp), which parks the worker in SleepForever and queues an APC on
+		// the main thread to show the crash dialog. A plain future.wait() is not
+		// alertable, so the APC never ran: the worker never consumed TerminateJob,
+		// this wait never returned, the window stopped pumping, and the game read as
+		// frozen with the audio still playing (the 3D-floor freeze, 2026-08). Wait in
+		// slices and service APCs between them so a worker fault becomes a crash
+		// report instead of a hang. SleepEx(0, TRUE) costs nothing when none is queued.
+		while( future.wait_for( std::chrono::milliseconds( 250 ) ) != std::future_status::ready )
+		{
+			SleepEx( 0, TRUE );
+		}
+#else
 		future.wait();
+#endif
 		MTWait.Unclock();
 	}
 	else

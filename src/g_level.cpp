@@ -1382,9 +1382,56 @@ void G_DoLoadLevel(const FString &nextmapname, int position, bool autosave, bool
 	I_UpdateWindowTitle();
 }
 
+#if HAVE_RT
+extern FString RT_GetMapWadName( const char* mapname );
+#endif
+
 void FLevelLocals::DoLoadLevel(const FString &nextmapname, int position, bool autosave, bool newGame)
 {
 	MapName = nextmapname;
+#if HAVE_RT
+	RT_MapName = "";
+	{
+		FString wad_of_map = RT_GetMapWadName( MapName.GetChars() );
+
+		// paranoia
+		bool isdoom2wad = wad_of_map.CompareNoCase( "doom2" ) == 0 ||
+		                  wad_of_map.CompareNoCase( "doom2.wad" ) == 0;
+
+		if( wad_of_map.IsEmpty() || isdoom2wad )
+		{
+			RT_MapName = MapName.MakeLower();
+		}
+		else
+		{
+			RT_MapName = wad_of_map.MakeLower() + "_" + MapName.MakeLower();
+		}
+	}
+
+	// Every level load, not just the ones that go through G_InitNew. Ordinary
+	// map-to-map progression does not call G_InitNew, so without this the moon
+	// aim, rt_sky, cloud deck and fog request stay on the PREVIOUS map's values
+	// when you walk into a level, but are correct when you type `map mapNN`.
+	// Takes the plain map name ("MAP13"), matching the preset tables' keys --
+	// not RT_MapName, which is wad-prefixed.
+	{
+		extern void RT_OnLevelLoadPresets( const char* );
+		RT_OnLevelLoadPresets( MapName.GetChars() );
+		// AND THE FIRE SKY AFTER IT, for the reason the call above exists.
+		//
+		// This site runs LATER than RT_OnLevelLoad's pair (G_InitNew ->
+		// G_DoLoadLevel), so re-applying the preset tables here undid
+		// everything rt_firesky.cpp had just set: rt_clouds went back to the
+		// launcher's 0 and RT_ApplyMoonPreset put the moon back to intensity 0.
+		// The symptom was "the mode announces itself and there are no clouds
+		// and no moon" -- the cvars were written and then overwritten a moment
+		// later, on the same level load, with nothing in the log to say so.
+		// Anything that overrides a preset table has to be re-run wherever that
+		// table is.
+		extern void RT_FireSkyOnLevelLoad( const char* );
+		RT_FireSkyOnLevelLoad( MapName.GetChars() );
+	}
+#endif
 	static int lastposition = 0;
 	int i;
 

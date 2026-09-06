@@ -800,6 +800,28 @@ endif()
 if (HAVE_RT)
 	set(RT_SOURCES
 		common/rendering/rt/rt_main.cpp
+		common/rendering/rt/rt_cvars.cpp
+		common/rendering/rt/rt_stats.cpp
+		common/rendering/rt/rt_quality.cpp
+		common/rendering/rt/rt_draw.cpp
+		common/rendering/rt/rt_weapon.cpp
+		common/rendering/rt/rt_lights_sector.cpp
+		common/rendering/rt/rt_lights_fixtures.cpp
+		common/rendering/rt/rt_lights_fx.cpp
+		common/rendering/rt/rt_light_shafts.cpp
+		common/rendering/rt/rt_dust.cpp
+		common/rendering/rt/rt_smoke.cpp
+		common/rendering/rt/rt_sparks.cpp
+		common/rendering/rt/rt_spark_surfaces.cpp
+		common/rendering/rt/rt_spark_draw.cpp
+		common/rendering/rt/rt_impacts.cpp
+		common/rendering/rt/rt_barrel.cpp
+		common/rendering/rt/rt_presets.cpp
+		common/rendering/rt/rt_weather.cpp
+		common/rendering/rt/rt_firesky.cpp
+		common/rendering/rt/rt_vclouds.cpp
+		common/rendering/rt/rt_export.cpp
+		common/rendering/rt/rt_titles.cpp
 		common/rendering/rt/rt_cutscene.cpp
 		common/rendering/rt/rt_runtime.cpp
 	)

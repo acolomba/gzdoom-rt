@@ -267,6 +267,9 @@ void HWWall::RenderTexturedWall(HWWallDispatcher*di, FRenderState &state, int rf
 	float absalpha = fabsf(alpha);
 	if (lightlist == nullptr)
 	{
+		// See hw_flats.cpp -- rt_sector_emis_freeze, self-emission only.
+		auto rtsectorlight = rtstate.push_sectorlight(
+			Colormap.LightColor, RT_EmisLightLevel(frontsector, lightlevel));
 		if (type != RENDERWALL_M2SNF) SetFog(state, di->Level, di->lightmode, lightlevel, rel, di->isFullbrightScene(), &Colormap, RenderStyle == STYLE_Add);
 		SetColor(state, di->Level, di->lightmode, lightlevel, rel, di->isFullbrightScene(), Colormap, absalpha);
 		RenderWall(state, rflags);
@@ -289,6 +292,13 @@ void HWWall::RenderTexturedWall(HWWallDispatcher*di, FRenderState &state, int rf
 				thiscm.FadeColor = Colormap.FadeColor;
 				thiscm.FogDensity = Colormap.FogDensity;
 				CopyFrom3DLight(thiscm, &(*lightlist)[i]);
+				// The 3D-floor split: thisll comes from the CASTER's control sector when
+				// there is one, so that is the sector whose animation has to be undone.
+				auto rtsectorlight = rtstate.push_sectorlight(
+					thiscm.LightColor,
+					RT_EmisLightLevel((*lightlist)[i].caster ? (*lightlist)[i].caster->model
+					                                         : frontsector,
+					                  thisll));
 				SetColor(state, di->Level, di->lightmode, thisll, rel, false, thiscm, absalpha);
 				if (type != RENDERWALL_M2SNF) SetFog(state, di->Level, di->lightmode, thisll, rel, false, &thiscm, RenderStyle == STYLE_Add);
 				SetSplitPlanes(state, (*lightlist)[i].plane, lowplane);
@@ -348,13 +358,26 @@ void HWWall::DrawWall(HWWallDispatcher*di, FRenderState &state, bool translucent
 	extern bool RT_IsWallNoMotionVectors( const seg_t* seg, side_t::ETexpart part );
 
 	assert(!lightlist);
-	auto rtexp = rtstate.push_type(RT_IsWallExportable(this->seg) ? RtPrim::ExportMap : RtPrim::Identity);
+	// Sector skyboxes composite a second camera in HW; under RT that room geometry
+	// uploads as a white/black box in the main scene. Ignore it and let rt_sky_always
+	// supply the raster night sky (SPACE) instead.
+	auto rtexp = rtstate.push_type(
+		portalState.inskybox ? RtPrim::Ignored
+		: RT_IsWallExportable(this->seg) ? RtPrim::ExportMap
+		                                 : RtPrim::Identity);
 	auto rttype = rtstate.push_type(
 		type == RENDERWALL_MIRRORSURFACE ? RtPrim::Mirror :
 		translucent ? RtPrim::Glass :
 		RtPrim::Identity);
 	// 'this->seg->sidedef' is not unique, hope that primitives for each of them are pushed in a certain order
 	auto rttemp = rtstate.push_uniqueid<RtManyPrimsPerId::Set0>(this->seg->sidedef);
+	// The painted half of rt_pillar_chase. Asked per sidedef, because that is the
+	// only thing that knows WHICH face of the pillar this is, and the crest's whole
+	// claim is that different faces are lit at different moments. The strength rides
+	// along in RT_ChasePanelEmisCurrent(); see rt_lights_fixtures.cpp.
+	auto rtchase = rtstate.push_type( RT_ChasePanelBegin( this->seg->sidedef )
+	                                      ? RtPrim::ChasedPanel
+	                                      : RtPrim::Identity );
 	auto rtwall =
 	    rtstate.push_type( RT_IsWallNoMotionVectors( this->seg,
 	                                                 type == RENDERWALL_TOP      ? side_t::top

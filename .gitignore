@@ -53,3 +53,6 @@
 /gzdoomd
 /gzdoomrd
 /gzdoommsr
+
+# Backup of the stock application icon, kept by tools/make_app_icon.py --revert
+*.pre_d64rt

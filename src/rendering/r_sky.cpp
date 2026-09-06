@@ -42,6 +42,7 @@
 #include "palentry.h"
 #include "bitmap.h"
 
+
 //
 // sky mapping
 //
@@ -143,6 +144,7 @@ void R_UpdateSky (uint64_t mstime)
 		// The hardware renderer uses a different value range and clamps it to a single rotation
 		Level->hw_sky1pos = (float)(fmod((double(mstime) * Level->skyspeed1), 1024.) * (90. / 256.));
 		Level->hw_sky2pos = (float)(fmod((double(mstime) * Level->skyspeed2), 1024.) * (90. / 256.));
+
 	}
 }
 

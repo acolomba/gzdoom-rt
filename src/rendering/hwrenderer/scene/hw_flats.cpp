@@ -51,6 +51,7 @@
 #if HAVE_RT
 #include "rt/rt_cvars.h"
 #include "rt/rt_state.h"
+#include "hwrenderer/scene/hw_portal.h"
 #endif
 
 #ifdef _DEBUG
@@ -310,11 +311,23 @@ void HWFlat::DrawFloodPlanes(HWDrawInfo *di, FRenderState &state)
 void HWFlat::DrawFlat(HWDrawInfo *di, FRenderState &state, bool translucent)
 {
 #if HAVE_RT
-	auto rtexp = rtstate.push_type(RT_IsSectorExportable(sector, ceiling) ? RtPrim::ExportMap : RtPrim::Identity);
+	// See HWWall::DrawWall — sector skybox rooms must not enter the RT scene.
+	auto rtexp = rtstate.push_type(
+		portalState.inskybox ? RtPrim::Ignored
+		: RT_IsSectorExportable(sector, ceiling) ? RtPrim::ExportMap
+		                                         : RtPrim::Identity);
     auto rttype = rtstate.push_type(
         (hacktype & SSRF_PLANEHACK) || (hacktype & SSRF_FLOODHACK) ?
         RtPrim::Ignored : RtPrim::Identity);
     auto rtnorm = rtstate.push_type(ceiling ? RtPrim::Identity : RtPrim::ExportInvertNormals);
+    // Only a plane that ACTUALLY got bulb-lattice lights gives up its painted glow.
+    // Asked per plane, not per texture: MAP03 hangs SFLATAQ on 46 ceilings and their 46
+    // matching floors, mostly thin recessed strips too small for the lattice to place
+    // anything in -- suppressing those by texture name left a dead groove with neither
+    // glow nor light. Both planes are asked because the lattice lights floors too.
+    auto rtflat = rtstate.push_type(
+        (sector && RT_IsLatticeLitPlane(unsigned(sector->Index()), ceiling))
+            ? RtPrim::LatticeLitFlat : RtPrim::Identity);
     // sector is not unique -- but subsector is, hope that they are pushed in a certain order
     auto rttemp = rtstate.push_uniqueid<RtManyPrimsPerId::Set1>(sector, ceiling ? 0 : 1);
 #endif
@@ -330,6 +343,11 @@ void HWFlat::DrawFlat(HWDrawInfo *di, FRenderState &state, bool translucent)
 
 	state.SetNormal(plane.plane.Normal().X, plane.plane.Normal().Z, plane.plane.Normal().Y);
 
+	// Self-emission reads the authored lightlevel while a light thinker animates
+	// this sector -- rt_sector_emis_freeze. Nothing else on this line changes: the
+	// SetColor/SetFog calls below still get the live value.
+	auto rtsectorlight =
+		rtstate.push_sectorlight(Colormap.LightColor, RT_EmisLightLevel(sector, lightlevel));
 	SetColor(state, di->Level, di->lightmode, lightlevel, rel, di->isFullbrightScene(), Colormap, alpha);
 	SetFog(state, di->Level, di->lightmode, lightlevel, rel, di->isFullbrightScene(), &Colormap, false);
 	state.SetObjectColor(FlatColor | 0xff000000);
@@ -676,6 +694,12 @@ void HWFlat::ProcessSector(HWDrawInfo *di, sector_t * frontsector, int which)
 			if ((rover->flags&(FF_EXISTS | FF_RENDERPLANES | FF_THISINSIDE)) == (FF_EXISTS | FF_RENDERPLANES))
 			{
 				if (rover->flags&FF_FOG && di->isFullbrightScene()) continue;
+#if HAVE_RT
+				// Doom64-RT: the sector's own planes skip skyflatnum (above); a rover
+				// never did, and the RT scene has no sky-portal state for a flat, so a
+				// sky-flatted 3D floor would upload as an opaque slab. Skip it.
+				if (*rover->top.texture == skyflatnum || *rover->bottom.texture == skyflatnum) continue;
+#endif
 				if (!rover->top.copied && rover->flags&(FF_INVERTPLANES | FF_BOTHPLANES))
 				{
 					double ff_top = rover->top.plane->ZatPoint(sector->centerspot);
@@ -724,6 +748,12 @@ void HWFlat::ProcessSector(HWDrawInfo *di, sector_t * frontsector, int which)
 			if ((rover->flags&(FF_EXISTS | FF_RENDERPLANES | FF_THISINSIDE)) == (FF_EXISTS | FF_RENDERPLANES))
 			{
 				if (rover->flags&FF_FOG && di->isFullbrightScene()) continue;
+#if HAVE_RT
+				// Doom64-RT: the sector's own planes skip skyflatnum (above); a rover
+				// never did, and the RT scene has no sky-portal state for a flat, so a
+				// sky-flatted 3D floor would upload as an opaque slab. Skip it.
+				if (*rover->top.texture == skyflatnum || *rover->bottom.texture == skyflatnum) continue;
+#endif
 				if (!rover->bottom.copied && rover->flags&(FF_INVERTPLANES | FF_BOTHPLANES))
 				{
 					double ff_bottom = rover->bottom.plane->ZatPoint(sector->centerspot);

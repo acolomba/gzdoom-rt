@@ -6,6 +6,7 @@
     #include "i_mainwindow.h"
     #include "win32rtvideo.h"
 #endif
+#include "rt_stats.h"
 #include "i_time.h"
 #include "m_argv.h"
 
@@ -17,6 +18,7 @@
 #include "c_dispatch.h"
 #include "hw_renderstate.h"
 #include "g_levellocals.h"
+#include "a_dynlight.h"
 #include "r_utility.h"
 #include "v_draw.h"
 #include "flatvertices.h"
@@ -26,8 +28,18 @@
 #include "hw_viewpointbuffer.h"
 #include "i_modelvertexbuffer.h"
 #include "p_lnspec.h"
+// rt_dump_lightthinkers: DLighting and its subclasses, so a running light effect can be
+// named at runtime when the map file does not explain one.
+#include "mapthinkers/a_lights.h"
 #include "image.h"
-#include "filesystem.h"
+#include "texturemanager.h"
+#include "actor.h"
+#include "d_player.h" // player_t::ReadyWeapon, for RT_AddWeaponGlow
+// whatsthat: name the surface under the crosshair instead of guessing it from a
+// screenshot. P_LineTrace + the hit's texture/sector.
+#include "p_linetracedata.h"
+#include "p_local.h"
+#include "r_state.h"
 
 #include "rt_state.h"
 #include "rt_video.h"
@@ -40,9 +52,12 @@
 #endif
 
 #include <filesystem>
+#include <cmath>
+#include <random>
 #include <span>
 #include <variant>
 #include <ranges>
+#include <unordered_map>
 #include <unordered_set>
 #include <cstdlib>
 #include <cstdio>
@@ -61,6 +76,12 @@
 #endif
 #include <RTGL1/RTGL1.h>
 
+// Generated fist offsets + colours for RT_UploadHandGlowLights.
+#include "rt_hand_lights.h"
+
+// Generated lit-switch-face table for RT_UploadSwitchLights.
+#include "rt_switch_lights.h"
+
 RgInterface rt      = {};
 FRtState    rtstate = {};
 
@@ -73,218 +94,11 @@ bool g_isremix{ false };
 //
 //
 
-// clang-format off
-template< typename T >
-using ValueToCVarRef = 
-    std::conditional_t< std::is_same_v< T, bool  >, FBoolCVarRef,
-    std::conditional_t< std::is_same_v< T, int   >, FIntCVarRef,
-    std::conditional_t< std::is_same_v< T, float >, FFloatCVarRef,
-    void > > >;
+#include "rt_cvars.h"
+#include "rt_internal.h"
+#include "rt_buffers.h"
+#include "rt_renderstate.h"
 
-template< typename T >
-constexpr ECVarType ValueToCVarType = 
-    std::is_same_v< T, bool  > ? ECVarType::CVAR_Bool :
-    std::is_same_v< T, int   > ? ECVarType::CVAR_Int :
-    std::is_same_v< T, float > ? ECVarType::CVAR_Float :
-                                 ECVarType::CVAR_Dummy;
-
-#define RT_CVAR( name, default_value, description ) \
-    ValueToCVarRef< decltype( default_value ) > name; \
-    static FCVarDecl cvardecl_##name = { \
-        &name, \
-        ValueToCVarType< decltype( default_value ) >, \
-        CVAR_GLOBALCONFIG | ( ( #name )[ 0 ] == '_' ? 0 : CVAR_ARCHIVE ), \
-        #name, \
-        CVarValue<ValueToCVarType< decltype( default_value ) >>( default_value ), \
-        description, \
-        nullptr, }; \
-    extern FCVarDecl const *const cvardeclref_##name; \
-    MSVC_VSEG FCVarDecl const *const cvardeclref_##name GCC_VSEG = &cvardecl_##name;
-
-#define RT_CVAR_COLOR( name, default_value, description ) \
-    CVARD( Color, name, default_value, CVAR_GLOBALCONFIG | CVAR_ARCHIVE, description )
-// clang-format on
-
-
-// clang-format off
-namespace cvar
-{
-    // NOTE: if name start with '_' then the cvar won't be archived
-
-    RT_CVAR( rt_cpu_cullmode,           0,      "[IMPACTS CPU PERFORMANCE HEAVILY] 0: BSP + all neighbor sectors of visible,  1 - original GZDoom's BSP/clip checks,  2: uploading whole map, no culling at all" )
-    RT_CVAR( rt_cpu_nocullradius,       10.f,   "[IMPACTS CPU PERFORMANCE] Radius (in meters) in which culling must not be applied. Applicable with rt_cpu_cullmode=0" )
-
-    RT_CVAR( rt_autoexport,             true,   "if true: if map's gltf doesn't exist on disk, export to gltf "
-                                                "and process the map as if it's static (which improves performance / stability)" )
-    RT_CVAR( rt_autoexport_light,       200.f,  "On auto export to gltf, apply this multiplier to the sector light intensities" ) 
-    RT_CVAR( rt_static_ignore_polyobjects, true, "ignore external static scenes on maps with polyobjects, so moving walls and doors stay in live geometry" )
-
-    RT_CVAR( rt_classic,                0.f,    "[0.0,1.0] what portion of the screen to render with a classic mode" )
-    RT_CVAR( rt_classic_mus,            true,   "if true, apply high pass filter to music when classic mode is enabled" )
-    RT_CVAR( rt_classic_white,          3.0f,   "white point for classic renderer" )
-    RT_CVAR( rt_classic_llmin,          0.07f,  "min light level: remaps a gzdoom sector light level from [0.0,1.0] range to [rt_classic_llMIN,rt_classic_llMAX]" )
-    RT_CVAR( rt_classic_llmax,          1.0f,   "max light level: remaps a gzdoom sector light level from [0.0,1.0] range to [rt_classic_llMIN,rt_classic_llMAX]" )
-    RT_CVAR( rt_classic_llpow,          5.0f,   "power to apply to convert a gzdoom sector light level [0.0,1.0] to visible intensity" )
-
-    RT_CVAR( rt_framegen,               0,      "enable frame generation via DirectX 12 and DXGI swapchain. DLSS3 if rt_upscale_dlss>0, FSR3 if rt_upscale_fsr2>0. "
-                                                "Values:  0=off  1=on  -1=run frame generation logic, but skip presentation of the generated frame." )
-    RT_CVAR( rt_dxgi,                   false,  "use DXGI (DirectX 12) swapchain to present to screen, better compatibility with Windows windowing system" )
-    RT_CVAR( rt_vsync,                  false,  "vertical synchronization to prevent tearing" )
-    RT_CVAR( rt_hdr,                    false,  "enable HDR output for display" )
-
-#ifdef _WIN32
-    RT_CVAR( rt_fluid,                  true,   "enable fluid simulation (blood)" )
-#else
-    RT_CVAR( rt_fluid,                  false,  "enable fluid simulation (blood)" )
-#endif
-    RT_CVAR( rt_fluid_budget,         100000,   "(APPLIED ONLY after disabling rt_fluid) fluid simulation particle budget " )
-    RT_CVAR( rt_fluid_pradius,          0.1f,   "(APPLIED ONLY after disabling rt_fluid) radis of one particle (in meters) for fluid simulation" )
-    RT_CVAR( rt_fluid_gravity_x,        0.f,    "gravity vector for fluid (horizontal, X), in m/s^2" )
-    RT_CVAR( rt_fluid_gravity_y,        0.f,    "gravity vector for fluid (horizontal, Y), in m/s^2" )
-    RT_CVAR( rt_fluid_gravity_z,        -9.8f,  "gravity vector for fluid (vertical), in m/s^2" )
-    RT_CVAR( rt_blood_color_r,          0.4f,   "color for blood fluid (Red)" )
-    RT_CVAR( rt_blood_color_g,          0.0f,   "color for blood fluid (Green)" )
-    RT_CVAR( rt_blood_color_b,          0.0f,   "color for blood fluid (Blue)" )
-    
-    RT_CVAR( rt_renderscale,            0.f,    "[0.2, 1.0] resolution scale")
-    RT_CVAR( rt_upscale_dlss,           0,      "0 - off, 1 - quality, 2 - balanced, 3 - perf, 4 - ultra perf, 5 - DLSS with rt_renderscale, 6 - DLAA. "
-                                                "This controls the DLSS upscaling (Super Resolution) but not the Frame Generation" )
-    RT_CVAR( rt_upscale_fsr2,           0,      "0 - off, 1 - quality, 2 - balanced, 3 - perf, 4 - ultra perf, 5 - FSR2 with rt_renderscale, 6 - native. "
-                                                "This controls the FSR3 / FSR2 upscaling (Super Resolution), but not the Frame Generation.")
-    RT_CVAR( rt_sharpen,                0,      "image sharpening; 0 - auto, 1 - naive, 2 - AMD CAS, 3 - force disable" )
-
-    RT_CVAR( rt_remix_rayreconstr,      false,  "[only for RTX Remix] DLSS Ray Reconstruction - denoise path tracing with AI" )
-    RT_CVAR( rt_remix_reflex,           true,   "[only for RTX Remix] Reflex - reduce latency between inputs and visible results" )
-    RT_CVAR( rt_remix_taa,              0,      "[only for RTX Remix] temporal anti aliasing. 0 - off, 1 - quality, 2 - balanced, 3 - perf, 4 - ultra perf, 5 - FSR2 with rt_renderscale, 6 - native" )
-
-    RT_CVAR( rt_shadowrays,             4,      "max depth of shadow ray casts" )
-    RT_CVAR( rt_withplayer,             true,   "enable player model for shadows, reflections etc" )
-    RT_CVAR( rt_lerpmdlangle,           true,   "interpolate subtick rotation for replacements" )
-    RT_CVAR( rt_spectre,                0,      "render spectres as: 0 - water, 1 - glass, 2 - mirror" )
-    RT_CVAR( rt_spectre_invis1,         0,      "render first-person weapons, viewer invisibility as: 0 - water, 1 - glass, 2 - mirror" )
-    RT_CVAR( rt_znear,                  0.07f,  "camera near plane (in meters); precision problems occur on a first-person weapons if too small (<=0.05)" )
-    RT_CVAR( rt_zfar,                   2048.f, "camera far plane (in meters); precision problems occur on a first-person weapons if too large" )
-
-    RT_CVAR( rt_normalmap_stren,        1.f,    "normal map influence" )
-    RT_CVAR( rt_heightmap_stren,        1.f,    "height map influence" )
-    RT_CVAR( rt_emis_mapboost,          200.f,  "indirect illumination emissiveness" )
-    RT_CVAR( rt_emis_maxscrcolor,       8.f,    "burn on-screen emissive colors" )
-    RT_CVAR( rt_emis_additive_dflt,     0.5f,   "emission value for objects with additive blending" )
-    RT_CVAR( rt_smoothtextures,         false,  "enable linear texture filtering" )
-
-    RT_CVAR( rt_tnmp_ev100_min,         2.f,    "min brightness for auto-exposure" )
-    RT_CVAR( rt_tnmp_ev100_max,         7.7f,   "max brightness for auto-exposure" )
-    RT_CVAR( rt_tnmp_saturation_r,      0.f,    "-1 desaturate, +1 over saturate" )
-    RT_CVAR( rt_tnmp_saturation_g,      0.f,    "-1 desaturate, +1 over saturate" )
-    RT_CVAR( rt_tnmp_saturation_b,      0.f,    "-1 desaturate, +1 over saturate" )
-    RT_CVAR( rt_tnmp_crosstalk_r,       1.0f,   "how much to shift Red, when Green or Blue are intense; set one channel to 1.0, others to <= 1.0" )
-    RT_CVAR( rt_tnmp_crosstalk_g,       0.7f,   "how much to shift Green, when Red or Blue are intense; set one channel to 1.0, others to <= 1.0" )
-    RT_CVAR( rt_tnmp_crosstalk_b,       0.8f,   "how much to shift Blue, when Red or Green are intense; set one channel to 1.0, others to <= 1.0" )
-    RT_CVAR( rt_tnmp_contrast,          0.1f,   "(only if rt_hdr is OFF) LDR contrast" )
-    RT_CVAR( rt_hdr_contrast,           0.15f,  "(only if rt_hdr is ON) HDR contrast" )
-    RT_CVAR( rt_hdr_saturation,         0.15f,  "(only if rt_hdr is ON) HDR saturation: -1 desaturate, +1 over saturate" )
-    RT_CVAR( rt_hdr_brightness,         1.0f,   "(only if rt_hdr is ON) HDR brightess multiplier" )
-
-    RT_CVAR( rt_sky,                    100.f,  "sky intensity")
-    RT_CVAR( rt_sky_saturation,         1.f,    "sky saturation")
-    RT_CVAR( rt_sky_stretch,            1.2f,   "how much to stretch the sky sphere along the vertical axis")
-    RT_CVAR( rt_sky_always,             true,   "always submit sky geometry (even if it's not visible in primary view)")
-
-    RT_CVAR( rt_decals,                 true,   "draw decals. NOTE: impacts CPU performance, as gzdoom requires a doom-wall to be fullyparsed to submit its decals :(")
-
-    RT_CVAR( rt_lightlevel_min,            80,  "[replacements lights] min bound for translating gzdoom lightlevel to light intensity: if lightlevel below this, lights are multiplied by 0.0; must be >= 0" )
-    RT_CVAR( rt_lightlevel_max,           230,  "[replacements lights] max bound for translating gzdoom lightlevel to light intensity: if lightlevel above this, lights are multiplied by 1.0; must be <= 255" )
-    RT_CVAR( rt_lightlevel_exp,          2.0f,  "[replacements lights] exponent to apply when converting gzdoom lightlevel to light intensity" )
-
-    RT_CVAR( rt_flsh,                   false,  "flashlight enable")
-    RT_CVAR( rt_flsh_intensity,         200.f,  "flashlight intensity")
-    RT_CVAR( rt_flsh_radius,            0.02f,  "flashlight source disk radius in meters")
-    RT_CVAR( rt_flsh_angle,             35.f,   "flashlight width in degrees")
-    RT_CVAR( rt_flsh_r,                 -0.3f,  "flashlight position offset - right (in meteres)")
-    RT_CVAR( rt_flsh_u,                 -0.7f,  "flashlight position offset - up (in meteres)")
-    RT_CVAR( rt_flsh_f,                 0.0f,   "flashlight position offset - forward (in meteres)")
-
-    RT_CVAR( rt_sun,                    false,  "enable sun for debugging")
-    RT_CVAR( rt_sun_intensity,          1000.f, "sun intensity")
-    RT_CVAR( rt_sun_a,                  45.f,   "[-90, 90] sun altitude angle; how high it is from the horizon")
-    RT_CVAR( rt_sun_b,                  0.f,    "[0, 360] sun azimuth angle; hotizontal angle, counter-clockwise")
-    RT_CVAR_COLOR( rt_sun_color,      0xFFFFFF, "sun color (hex)")
-
-    RT_CVAR( rt_reflrefr_depth,         8,      "max depth of reflect/refract") 
-    RT_CVAR( rt_refr_glass,             1.52f,  "glass index of refraction") 
-    RT_CVAR( rt_refr_water,             1.33f,  "water index of refraction") 
-    RT_CVAR( rt_refr_thinwidth,         0.0f,   "approx. width of thin media, e.g. thin glass (in meters)") 
-    RT_CVAR( rt_refl_thresh,            0.0f,   "assume mirror if roughness is less than this value") 
-
-    RT_CVAR( rt_mzlflsh,                true,   "enable muzzle flash light source (activated on extralight)" )
-    RT_CVAR( rt_mzlflsh_intensity,      100.f,  "muzzle flash intensity" )
-    RT_CVAR_COLOR( rt_mzlflsh_color,  0xFF8C52, "muzzle flash color (hex)" )
-    RT_CVAR( rt_mzlflsh_radius,         0.02f,  "muzzle flash light sphere radius (in meters)")
-    RT_CVAR( rt_mzlflsh_offset,         0.6f,   "[0.0, 1.0] muzzle flash offset from the hit point, so the light would not be in a wall")
-    RT_CVAR( rt_mzlflsh_f,              3.0f,   "muzzle flash light offset - forward (in meteres)" )
-    RT_CVAR( rt_mzlflsh_u,              -0.9f,  "muzzle flash light offset - up (in meteres)" )
-
-    RT_CVAR( rt_volume_type,            1,      "0 - none, 1 - volumetric, 2 - distance based" )
-    RT_CVAR( rt_volume_far,             30.f,   "max distance of scattering volume (in meteres)" )
-    RT_CVAR( rt_volume_scatter,         1.f,    "density of media" )
-    RT_CVAR( rt_volume_ambient,         0.2f,   "ambient term" )
-    RT_CVAR( rt_volume_lintensity,      1.f,    "intensity of lights for scattering" )
-    RT_CVAR( rt_volume_lassymetry,      0.5f,   "scaterring phase function assymetry" )
-    RT_CVAR( rt_volume_history,         8.f,    "max history length for scaterring accumulation (in frames)" )
-
-    RT_CVAR( rt_water_r,                255,    "water color Red [0,255]" )
-    RT_CVAR( rt_water_g,                255,    "water color Green [0,255]" )
-    RT_CVAR( rt_water_b,                255,    "water color Blue [0,255]" )
-    RT_CVAR( rt_water_wavestren,        3.f,    "normal map strength for water" )
-
-    RT_CVAR( rt_bloom,                  true,   "enable bloom" )
-    RT_CVAR( rt_bloom_scale,            1.f,    "multiplier for a calculated bloom" )
-    RT_CVAR( rt_bloom_ev,               6.f,    "EV offset for bloom calculation input" )
-    RT_CVAR( rt_bloom_threshold,        16.f,   "brightness threshold for bloom calculation input" )
-    RT_CVAR( rt_bloom_dirt,             true,   "lens dirt enable" )
-    RT_CVAR( rt_bloom_dirt_scale,       1.5f,   "lens dirt multiplier" )
-    
-    RT_CVAR( rt_ef_crt,                 false,  "CRT-monitor filter" )
-    RT_CVAR( rt_ef_chraber,             0.15f,  "chromatic aberration intensity" )
-    RT_CVAR( rt_ef_vhs,                 0.f,    "VHS filter intensity" )
-    RT_CVAR( rt_ef_dither,              0.f,    "dithering filter intensity" )
-    RT_CVAR( rt_ef_vintage,             0,      "[0, 7] vintage effects, disabled if rt_renderscale>0" ) // look RT_VINTAGE_* enum
-    RT_CVAR( rt_ef_water,               true,   "warp screen while under water" )
-
-    RT_CVAR( rt_pw_lightamp,            0,      "light amplification powerup type: 0 - night vision, 1 - thermal camera, 2 - flashlight" )
-
-    RT_CVAR( rt_melt_duration,          1.5f,   "screen melt effect duration" )
-
-    RT_CVAR( rt_wall_nomv,              1,      "0: motion vectors always,  1: use pegging flags to determine wall motion vectors,  2: always force no motion vectors on walls. "
-                                                "This option is needed to fix illumination motion artifacts on lifts / crashers" )
-
-    RT_CVAR( hack_initialframesskip,    true,   "skip initial a couple of frames on game launch; if not skipped, there might be a distracting flashing of the main window" )
-
-    RT_CVAR( _rt_showexportable,        false,  "internal variable; only in debug" )
-
-	// default, so when user launches a game with CRT/Vintage,
-	// and after that changes to dlss/fsr2, then this value will be set to the cvars;
-	// 2 = balanced; non-archived
-    RT_CVAR( _rt_cachedpreset,          2,      "internal variable for menu UX" )
-
-    bool rt_available_dlss2   = false;
-    bool rt_available_dlss3fg = false;
-    bool rt_available_fsr2    = false;
-    bool rt_available_fsr3fg  = false;
-    bool rt_available_dxgi    = false;
-
-    const char* rt_failreason_dlss2   = nullptr;
-    const char* rt_failreason_dlss3fg = nullptr;
-    const char* rt_failreason_fsr2    = nullptr;
-    const char* rt_failreason_fsr3fg  = nullptr;
-    const char* rt_failreason_dxgi    = nullptr;
-
-    bool rt_hdr_available = false;
-    bool rt_fluid_available = false;
-
-    bool rt_firststart = false;
-}
-// clang-format on
 
 EXTERN_CVAR( Float, blood_fade_scalar );
 EXTERN_CVAR( Float, pickup_fade_scalar );
@@ -313,93 +127,8 @@ void RT_CloseLauncherWindow() {}
 
 auto RT_MakeUpRightForwardVectors( const DRotator& rotation ) -> std::tuple< RgFloat3D, RgFloat3D, RgFloat3D >;
 
-namespace
-{
-
-void RG_CHECK( RgResult r )
-{
-    assert( ( r ) == RG_RESULT_SUCCESS );
-}
-
-#define RG_TRANSFORM_IDENTITY              \
-    {                                      \
-        1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0 \
-    }
-
-constexpr auto ORIGINAL_DOOM_RESOLUTION_HEIGHT = 200;
-constexpr auto ONEGAMEUNIT_IN_METERS           = 1.0f / 32.0f; // https://doomwiki.org/wiki/Map_unit
-
-constexpr auto RG_PACKED_COLOR_WHITE = RgColor4DPacked32{ 0xFFFFFFFF };
-
-
-enum
-{
-    RT_VINTAGE_OFF,
-    RT_VINTAGE_CRT,
-    RT_VINTAGE_VHS,
-    RT_VINTAGE_VHS_CRT,
-    RT_VINTAGE_200,
-    RT_VINTAGE_200_DITHER,
-    RT_VINTAGE_480,
-    RT_VINTAGE_480_DITHER,
-};
-
-
-constexpr uint64_t FlashlightLightId  = 0xFFFFFFF + 0;
-constexpr uint64_t SunLightId         = 0xFFFFFFF + 1;
-constexpr uint64_t MuzzleFlashLightId = 0xFFFFFFF + 2;
-constexpr uint64_t SectorLightId_Base = 0xFFFFFFF + 3;
-
-
-void RT_AppendMapNamePart( char* dst, size_t& pos, size_t capacity, const char* src )
-{
-    if( capacity == 0 )
-    {
-        return;
-    }
-
-    for( ; src && *src && pos < capacity - 1; src++ )
-    {
-        unsigned char c = static_cast< unsigned char >( *src );
-        if( std::isalnum( c ) )
-        {
-            dst[ pos++ ] = static_cast< char >( std::tolower( c ) );
-        }
-        else if( pos > 0 && dst[ pos - 1 ] != '_' )
-        {
-            dst[ pos++ ] = '_';
-        }
-    }
-}
-
-void RT_AppendMapMd5( char* dst, size_t& pos, size_t capacity, const uint8_t md5[ 16 ] )
-{
-    constexpr char hex[] = "0123456789abcdef";
-
-    for( size_t i = 0; i < 16 && pos + 2 < capacity; i++ )
-    {
-        dst[ pos++ ] = hex[ md5[ i ] >> 4 ];
-        dst[ pos++ ] = hex[ md5[ i ] & 0x0F ];
-    }
-}
-
-bool RT_StaticSceneExists( const char* name )
-{
-    if( !name || name[ 0 ] == '\0' )
-    {
-        return false;
-    }
-
-    std::filesystem::path path = RT_ResolveRuntimePath();
-    path /= "scenes";
-    path /= name;
-    path /= std::string( name ) + ".gltf";
-
-    std::error_code ec;
-    return std::filesystem::is_regular_file( path, ec );
-}
-
-
+// Called from rt_presets.cpp and from the CCMDs that moved out of here, so it
+// cannot live in the anonymous namespace below.
 const char* RT_GetMapName()
 {
     if( g_rt_cutscenename && g_rt_cutscenename[ 0 ] != '\0' )
@@ -407,46 +136,11 @@ const char* RT_GetMapName()
         return g_rt_cutscenename;
     }
 
-    if( primaryLevel && !primaryLevel->MapName.IsEmpty() )
+    if( primaryLevel && !primaryLevel->RT_MapName.IsEmpty() )
     {
-        static char legacy_mapname_lower[ 64 ];
-        static char mapname_lower[ 256 ];
-
-        size_t legacy_i = 0;
-        RT_AppendMapNamePart(
-            legacy_mapname_lower, legacy_i, std::size( legacy_mapname_lower ), primaryLevel->MapName.GetChars() );
-        legacy_mapname_lower[ std::min( legacy_i, std::size( legacy_mapname_lower ) - 1 ) ] = '\0';
-
-        if( RT_StaticSceneExists( legacy_mapname_lower ) )
-        {
-            return legacy_mapname_lower;
-        }
-
-        size_t i = 0;
-        const int wadnum =
-            primaryLevel->lumpnum >= 0 ? fileSystem.GetFileContainer( primaryLevel->lumpnum ) : -1;
-        if( wadnum >= 0 )
-        {
-            RT_AppendMapNamePart(
-                mapname_lower, i, std::size( mapname_lower ), fileSystem.GetResourceFileName( wadnum ) );
-            if( i > 0 && i < std::size( mapname_lower ) - 1 )
-            {
-                mapname_lower[ i++ ] = '_';
-            }
-        }
-
-        RT_AppendMapNamePart(
-            mapname_lower, i, std::size( mapname_lower ), primaryLevel->MapName.GetChars() );
-
-        if( i > 0 && i < std::size( mapname_lower ) - 1 )
-        {
-            mapname_lower[ i++ ] = '_';
-        }
-        RT_AppendMapMd5( mapname_lower, i, std::size( mapname_lower ), primaryLevel->md5 );
-
-        mapname_lower[ std::min( i, std::size( mapname_lower ) - 1 ) ] = '\0';
-
-        return mapname_lower;
+        // Official modcompat: RT_MapName is set in p_openmap for PWAD maps
+        // so Doom II rt/scenes/map## do not collide with mod MAP01 etc.
+        return primaryLevel->RT_MapName.GetChars();
     }
 
     if( g_rt_showfirststartscene )
@@ -463,53 +157,6 @@ const char* RT_GetMapName()
     }
 
     return nullptr;
-}
-
-static bool RT_TextureNameEquals( const char* lhs, const char* rhs )
-{
-    if( !lhs || !rhs )
-    {
-        return false;
-    }
-
-    for( ; *lhs && *rhs; lhs++, rhs++ )
-    {
-        const unsigned char a = static_cast< unsigned char >( *lhs );
-        const unsigned char b = static_cast< unsigned char >( *rhs );
-        if( std::toupper( a ) != std::toupper( b ) )
-        {
-            return false;
-        }
-    }
-
-    return *lhs == '\0' && *rhs == '\0';
-}
-
-static constexpr const char* RT_EXPLICIT_LAVA_FLAT_TEXTURES[] = {
-    "FLTLAVA1", "FLTLAVA2", "FLTLAVA3", "FLTLAVA4", "FLATHUH1",
-    "X_001",    "X_002",    "X_003",    "X_004",
-};
-
-static const char* RT_CanonicalExplicitLavaFlatTexture( const char* texname )
-{
-    for( const char* canonical : RT_EXPLICIT_LAVA_FLAT_TEXTURES )
-    {
-        if( RT_TextureNameEquals( texname, canonical ) )
-        {
-            return canonical;
-        }
-    }
-    return nullptr;
-}
-
-static bool RT_IsExplicitLavaFlatTexture( const char* texname )
-{
-    return RT_CanonicalExplicitLavaFlatTexture( texname ) != nullptr;
-}
-
-static bool RT_ShouldForceLavaFloorTexture( const char* texname )
-{
-    return RT_IsExplicitLavaFlatTexture( texname );
 }
 
 static bool RT_ShouldIgnoreExternalGeometry()
@@ -530,1595 +177,90 @@ bool RT_ForceNoClassicMode()
     return false;
 }
 
-
-
-constexpr auto RT_BIT( uint32_t b )
+// Doom64-RT: where are the sky openings, in world units?
+//
+// The leak hunt kept stalling on "which opening is feeding this room", a question
+// no screenshot answers on its own -- the sky geometry that admits the light is
+// usually not the sky geometry you can see. So every SKY_VISIBILITY primitive
+// submitted this frame is recorded here with its bounding box, and `rt_sky_here`
+// prints the ones nearest the camera.
+//
+// Recorded per frame rather than per level because sky portals are submitted by
+// the renderer as it walks the BSP -- the set depends on where you are standing,
+// which is exactly what makes it useful.
+namespace
 {
-    return 1u << b;
-}
-enum rt_powerupflag_t
+struct SkyPrimNote
 {
-    RT_POWERUP_FLAG_BONUS_BIT          = RT_BIT( 1 ),
-    RT_POWERUP_FLAG_BERSERK_BIT        = RT_BIT( 2 ),
-    RT_POWERUP_FLAG_RADIATIONSUIT_BIT  = RT_BIT( 3 ),
-    RT_POWERUP_FLAG_INVUNERABILITY_BIT = RT_BIT( 4 ),
-    RT_POWERUP_FLAG_INVISIBILITY_BIT   = RT_BIT( 5 ),
-    RT_POWERUP_FLAG_NIGHTVISION_BIT    = RT_BIT( 6 ),
-    RT_POWERUP_FLAG_THERMALVISION_BIT  = RT_BIT( 7 ),
-    RT_POWERUP_FLAG_FLASHLIGHT_BIT     = RT_BIT( 8 ),
-};
-uint32_t RT_CalcPowerupFlags();
-
-
-
-constexpr float pi()
-{
-    return pi::pif();
-}
-
-constexpr float to_rad( float degrees )
-{
-    return degrees * ( pi() / 180.0f );
-}
-
-constexpr FVector3 gzvec3(const RgFloat3D &v)
-{
-    return { v.data[ 0 ], v.data[ 1 ], v.data[ 2 ] };
-}
-
-constexpr DVector3 gzvec3d(const RgFloat3D &v)
-{
-    return { v.data[ 0 ], v.data[ 1 ], v.data[ 2 ] };
-}
-
-template< typename T >
-auto applygamma( T x ) = delete;
-template<>
-auto applygamma( float x )
-{
-    return std::clamp( x * x, 0.f, 1.f );
-}
-template<>
-auto applygamma( uint8_t x )
-{
-    return static_cast< uint8_t >( applygamma( float( x ) / 255.f ) * 255.f );
-}
-
-auto rtcolor( const PalEntry& e ) -> RgColor4DPacked32
-{
-    return rt.rgUtilPackColorByte4D( e.r, e.g, e.b, e.a );
-}
-
-auto rtcolor( const FVector4PalEntry& e ) -> RgColor4DPacked32
-{
-    return rt.rgUtilPackColorFloat4D( e.r, e.g, e.b, e.a );
-}
-
-auto cvarcolor_to_rtcolor( const FColorCVarRef& cvarcolor ) -> RgColor4DPacked32
-{
-    uint32_t ba = *( cvarcolor );
-
-    int r = RPART( ba );
-    int g = GPART( ba );
-    int b = BPART( ba );
-
-    return rt.rgUtilPackColorByte4D( r, g, b, 255 );
-}
-
-float lightlevel_to_classic( bool isui, float lightlevel )
-{
-    if( isui )
-    {
-        return 1.0f;
-    }
-
-    if( lightlevel < 0.0f )
-    {
-        return 1.0f;
-    }
-
-    float lmin = std::max( float( cvar::rt_classic_llmin ), 0.0f );
-    float lmax = std::min( float( cvar::rt_classic_llmax ), 1.0f );
-
-    float lrange = std::max( lmax - lmin, 0.0f );
-    if( lrange < 0.001f )
-    {
-        lmin   = 0.0f;
-        lmax   = 1.0f;
-        lrange = 1.0f;
-    }
-
-    float t01 = std::clamp( lightlevel, 0.0f, 1.0f );
-    t01       = std::pow( t01, float( cvar::rt_classic_llpow ) );
-    
-    return lmin + t01 * lrange;
-}
-
-auto rtcolor_multiply( const FVector4PalEntry& e, const FVector4& b, bool forcealpha1 ) -> RgColor4DPacked32
-{
-    return rt.rgUtilPackColorFloat4D( e.r * b[ 0 ], //
-                                      e.g * b[ 1 ],
-                                      e.b * b[ 2 ],
-                                      forcealpha1 ? 1.0f : e.a * b[ 3 ] );
-}
-
-auto rtcolor_bgr_alphagamma( const PalEntry& e ) -> RgColor4DPacked32
-{
-    return rt.rgUtilPackColorByte4D( e.b, e.g, e.r, applygamma( e.a ) );
-}
-
-
-
-class RTRenderState;
-
-class RTFrameBuffer : public SystemBaseFrameBuffer
-{
-    using Super = SystemBaseFrameBuffer;
-
-public:
-    RTFrameBuffer( void* hMonitor, bool fullscreen );
-    ~RTFrameBuffer() override;
-    void InitializeState() override;
-    void BeginFrame() override
-    {
-        SetViewportRects( nullptr );
-        RT_BeginFrame();
-        Super::BeginFrame();
-    }
-    void Update() override
-    {
-        this->Draw2D();
-        twod->Clear();
-        RT_DrawFrame();
-        Super::Update();
-    }
-    void FirstEye() override;
-
-    FRenderState*     RenderState() override;
-    IVertexBuffer*    CreateVertexBuffer() override;
-    IIndexBuffer*     CreateIndexBuffer() override;
-    IDataBuffer*      CreateDataBuffer( int bindingpoint, bool ssbo, bool needsresize ) override;
-    IHardwareTexture* CreateHardwareTexture( int numchannels ) override;
-
-    void SetVSync( bool vsync ) override { m_vsync = vsync; }
-    void SetTextureFilterMode() override {}
-    void SetLevelMesh( hwrenderer::LevelMesh* mesh ) override {}
-
-    void Draw2D() override;
-
-public:
-    void RT_MarkWasSky() { m_wassky = true; }
-
-private:
-    void RT_BeginFrame();
-    void RT_DrawFrame();
-
-private:
-    RTRenderState* m_state{ nullptr };
-    bool           m_vsync{ false };
-    bool           m_wassky{ false };
+    float min[ 3 ];
+    float max[ 3 ];
 };
 
+std::vector< SkyPrimNote > g_skyprims;
+std::vector< SkyPrimNote > g_skyprims_prev;
+} // namespace
 
-
-class VectorAsBuffer : virtual public IBuffer
+void RT_NoteSkyPrim( std::span< const RgPrimitiveVertex > verts )
 {
-public:
-    ~VectorAsBuffer() override = default;
-
-    void SetSubData( size_t offset, size_t size, const void* data ) override
+    if( !bool{ cvar::rt_sky_log } || verts.empty() )
     {
-        if( offset + size > m_buffer.size() )
+        return;
+    }
+    SkyPrimNote n{};
+    for( int c = 0; c < 3; c++ )
+    {
+        n.min[ c ] = n.max[ c ] = verts[ 0 ].position[ c ];
+    }
+    for( const auto& v : verts )
+    {
+        for( int c = 0; c < 3; c++ )
         {
-            m_buffer.resize( offset + size );
-        }
-
-        if( data )
-        {
-            memcpy( &m_buffer[ offset ], data, size );
-        }
-
-        buffersize = m_buffer.size();
-        if( map )
-        {
-            map = m_buffer.data();
+            n.min[ c ] = std::min( n.min[ c ], v.position[ c ] );
+            n.max[ c ] = std::max( n.max[ c ], v.position[ c ] );
         }
     }
-    void SetData( size_t size, const void* data, BufferUsageType type ) override
+    if( g_skyprims.size() < 4096 )
     {
-        SetSubData( 0, size, data );
+        g_skyprims.push_back( n );
     }
-    void* Lock( unsigned size ) override
-    {
-        SetSubData( 0, size, nullptr );
-        return m_buffer.data();
-    }
-    void Unlock() override {}
-    void Resize( size_t newsize ) override { m_buffer.resize( newsize ); }
-    void Upload( size_t start, size_t size ) override {}
-    void Map() override { map = m_buffer.data(); }
-    void Unmap() override { map = nullptr; }
-    void GPUDropSync() override {}
-    void GPUWaitSync() override {}
-
-protected:
-    auto AccessBuffer() const { return std::span{ m_buffer }; }
-
-private:
-    std::vector< uint8_t > m_buffer;
-};
-
-class RTVertexBuffer
-    : public IVertexBuffer
-    , public VectorAsBuffer
-{
-    using Super            = VectorAsBuffer;
-    using VertexTypeHolder = std::
-        variant< std::monostate, FSkyVertex, FModelVertex, FFlatVertex, F2DDrawer::TwoDVertex >;
-
-public:
-    void SetFormat( int                           numBindingPoints,
-                    int                           numAttributes,
-                    size_t                        stride,
-                    const FVertexBufferAttribute* attrs ) override
-    {
-        static_assert( sizeof( FSkyVertex ) != sizeof( FModelVertex ) );
-        static_assert( sizeof( FSkyVertex ) != sizeof( FFlatVertex ) );
-        static_assert( sizeof( FSkyVertex ) != sizeof( F2DDrawer::TwoDVertex ) );
-        static_assert( sizeof( FModelVertex ) != sizeof( FFlatVertex ) );
-        static_assert( sizeof( FModelVertex ) != sizeof( F2DDrawer::TwoDVertex ) );
-        static_assert( sizeof( FFlatVertex ) != sizeof( F2DDrawer::TwoDVertex ) );
-
-        if( numBindingPoints == 1 && numAttributes == 4 && stride == sizeof( FSkyVertex ) )
-        {
-            m_vertextype = FSkyVertex{};
-        }
-        else if( numBindingPoints == 2 && numAttributes == 8 && stride == sizeof( FModelVertex ) )
-        {
-            m_vertextype = FModelVertex{};
-        }
-        else if( numBindingPoints == 1 && numAttributes == 3 && stride == sizeof( FFlatVertex ) )
-        {
-            m_vertextype = FFlatVertex{};
-        }
-        else if( numBindingPoints == 1 && numAttributes == 3 &&
-                 stride == sizeof( F2DDrawer::TwoDVertex ) )
-        {
-            m_vertextype = F2DDrawer::TwoDVertex{};
-        }
-        else
-        {
-            assert( 0 );
-            m_vertextype = std::monostate{};
-        }
-        m_formatted.clear();
-    }
-
-    static void MakeFormatted( std::vector< RgPrimitiveVertex >& dst,
-                               size_t                            targetCount,
-                               std::span< const uint8_t >        srcbuf,
-                               const VertexTypeHolder&           vertextype )
-    {
-        // TODO: mStreamData.uVertexColor for lightstyled?
-
-
-        static auto gz_unpacknormal_x = []( uint32_t packedNormal ) -> float {
-            int inx = ( packedNormal & 1023 );
-            return float( inx ) / 512.0f;
-        };
-        static auto gz_unpacknormal_y = []( uint32_t packedNormal ) -> float {
-            int iny = ( ( packedNormal >> 10 ) & 1023 );
-            return float( iny ) / 512.0f;
-        };
-        static auto gz_unpacknormal_z = []( uint32_t packedNormal ) -> float {
-            int inz = ( ( packedNormal >> 20 ) & 1023 );
-            return float( inz ) / 512.0f;
-        };
-
-        static auto rg_packednormal_fallback = rt.rgUtilPackNormal( 0, 1, 0 );
-
-        // make by type
-        std::visit(
-            [ & ]< typename T >( const T& ) {
-                assert( srcbuf.size_bytes() % sizeof( T ) == 0 );
-
-                dst.reserve( targetCount );
-                for( size_t i = dst.size(); i < targetCount; i++ )
-                {
-                    static_assert( sizeof( decltype( srcbuf )::value_type ) == 1 );
-                    const auto* ptr = &srcbuf[ i * sizeof( T ) ];
-
-                    if constexpr( std::is_same_v< T, FSkyVertex > )
-                    {
-                        auto src = reinterpret_cast< const FSkyVertex* >( ptr );
-
-                        dst.push_back( RgPrimitiveVertex{
-                            .position     = { src->x * ONEGAMEUNIT_IN_METERS,
-                                              src->y * ONEGAMEUNIT_IN_METERS,
-                                              src->z * ONEGAMEUNIT_IN_METERS },
-                            .normalPacked = rg_packednormal_fallback,
-                            .texCoord     = { src->u, src->v },
-                            .color        = rtcolor( src->color ),
-                        } );
-                    }
-                    else if constexpr( std::is_same_v< T, FModelVertex > )
-                    {
-                        auto src = reinterpret_cast< const FModelVertex* >( ptr );
-
-                        dst.push_back( RgPrimitiveVertex{
-                            .position = { src->x * ONEGAMEUNIT_IN_METERS,
-                                          src->y * ONEGAMEUNIT_IN_METERS,
-                                          src->z * ONEGAMEUNIT_IN_METERS },
-                            .normalPacked =
-                                rt.rgUtilPackNormal( gz_unpacknormal_x( src->packedNormal ),
-                                                     gz_unpacknormal_y( src->packedNormal ),
-                                                     gz_unpacknormal_z( src->packedNormal ) ),
-                            .texCoord = { src->u, src->v },
-                            .color    = RG_PACKED_COLOR_WHITE,
-                        } );
-                    }
-                    else if constexpr( std::is_same_v< T, FFlatVertex > )
-                    {
-                        auto src = reinterpret_cast< const FFlatVertex* >( ptr );
-
-                        dst.push_back( RgPrimitiveVertex{
-                            .position     = { src->x * ONEGAMEUNIT_IN_METERS,
-                                              src->y * ONEGAMEUNIT_IN_METERS,
-                                              src->z * ONEGAMEUNIT_IN_METERS },
-                            .normalPacked = rg_packednormal_fallback,
-                            .texCoord     = { src->u, src->v },
-                            .color        = RG_PACKED_COLOR_WHITE,
-                        } );
-                    }
-                    else if constexpr( std::is_same_v< T, F2DDrawer::TwoDVertex > )
-                    {
-                        auto src = reinterpret_cast< const F2DDrawer::TwoDVertex* >( ptr );
-
-                        dst.push_back( RgPrimitiveVertex{
-                            .position     = { src->x, src->y, src->z },
-                            .normalPacked = rg_packednormal_fallback,
-                            .texCoord     = { src->u, src->v },
-                            .color        = rtcolor_bgr_alphagamma( src->color0 ),
-                        } );
-                    }
-                    else
-                    {
-                        assert( 0 );
-                    }
-                }
-            },
-            vertextype );
-    }
-
-    auto AccessFormatted( uint32_t first, uint32_t count ) -> std::span< const RgPrimitiveVertex >
-    {
-        if( std::holds_alternative< std::monostate >( m_vertextype ) )
-        {
-            return {};
-        }
-
-        if( first + count > m_formatted.size() )
-        {
-            MakeFormatted( m_formatted, first + count, AccessBuffer(), m_vertextype );
-        }
-
-        assert( first + count <= m_formatted.size() );
-
-        return std::span{
-            &m_formatted[ first ],
-            count,
-        };
-    }
-
-    void SetData( size_t size, const void* data, BufferUsageType type ) override
-    {
-        m_formatted.clear();
-        Super::SetData( size, data, type );
-    }
-
-    void SetSubData( size_t offset, size_t size, const void* data ) override
-    {
-        m_formatted.clear();
-        Super::SetSubData( offset, size, data );
-    }
-
-    void Unmap() override
-    {
-        m_formatted.clear();
-        Super::Unmap();
-    }
-
-    bool IsSky() const { return std::holds_alternative< FSkyVertex >( m_vertextype ); }
-    bool IsUI() const { return std::holds_alternative< F2DDrawer::TwoDVertex >( m_vertextype ); }
-
-private:
-    VertexTypeHolder m_vertextype;
-
-    std::vector< RgPrimitiveVertex > m_formatted;
-};
-
-class RTIndexBuffer
-    : public IIndexBuffer
-    , public VectorAsBuffer
-{
-    using IndexType = uint32_t;
-
-public:
-    auto AccessFormatted( uint32_t first, uint32_t count )
-    {
-        const auto rawbuf = AccessBuffer();
-        // loose type check
-        assert( rawbuf.size_bytes() % sizeof( IndexType ) == 0 );
-        // alignment
-        assert( uint64_t( rawbuf.data() ) % sizeof( IndexType ) == 0 );
-        // overflow
-        assert( sizeof( IndexType ) * ( first + count ) <= rawbuf.size_bytes() );
-
-        return std::span{
-            reinterpret_cast< const IndexType* >( rawbuf.data() ) + first,
-            count,
-        };
-    }
-
-    static auto CalcFirstVertexAndVertexCount( std::span< const IndexType > indices )
-    {
-        uint32_t imin = std::numeric_limits< uint32_t >::max();
-        uint32_t imax = std::numeric_limits< uint32_t >::lowest();
-        for( const auto& i : indices )
-        {
-            imin = std::min( imin, i );
-            imax = std::max( imax, i );
-        }
-        return std::pair{
-            imax > imin ? imin : 0,
-            imax > imin ? imax - imin + 1 : 0,
-        };
-    }
-
-    auto MakeWithNewFirstIndex( std::span< const IndexType > indices, IndexType newFirst )
-    {
-        m_cache.clear();
-        m_cache.reserve( indices.size() );
-
-        for( const auto& i : indices )
-        {
-            assert( i >= newFirst );
-            m_cache.push_back( i - newFirst );
-        }
-
-        return m_cache;
-    }
-
-private:
-    std::vector< IndexType > m_cache;
-};
-
-
-
-class RTHardwareTexture : public IHardwareTexture
-{
-public:
-    // Empty, as it's only used for software renderer
-    uint32_t CreateTexture( uint8_t*, int, int, int, bool, const char* ) override { return 0; }
-    void     AllocateBuffer( int, int, int ) override {}
-    uint8_t* MapBuffer() override { return nullptr; }
-
-    void CreateIfWasnt( FGameTexture&       src,
-                        int                 clampmode,
-                        int                 translation,
-                        int                 flags,
-                        const FRenderStyle& renderStyle )
-    {
-        auto rtclamp_x = []( int clampmode ) {
-            switch( clampmode )
-            {
-                case CLAMP_X:
-                case CLAMP_XY:
-                case CLAMP_XY_NOMIP:
-                case CLAMP_NOFILTER_X:
-                case CLAMP_NOFILTER_XY:
-                case CLAMP_CAMTEX: return RG_SAMPLER_ADDRESS_MODE_CLAMP;
-                default: return RG_SAMPLER_ADDRESS_MODE_REPEAT;
-            }
-        };
-        auto rtclamp_y = []( int clampmode ) {
-            switch( clampmode )
-            {
-                case CLAMP_Y:
-                case CLAMP_XY:
-                case CLAMP_XY_NOMIP:
-                case CLAMP_NOFILTER_Y:
-                case CLAMP_NOFILTER_XY:
-                case CLAMP_CAMTEX: return RG_SAMPLER_ADDRESS_MODE_CLAMP;
-                default: return RG_SAMPLER_ADDRESS_MODE_REPEAT;
-            }
-        };
-        auto desaturateIfNeed = []( FTextureBuffer& data, int flags, const char* lumpname ) {
-            // special case for the SmallFont...
-            const bool isSTCFNFont = !( flags & CTF_Indexed ) && lumpname &&
-                                     strlen( lumpname ) == 8 &&
-                                     strncmp( lumpname, "STCFN", 5 ) == 0;
-            if( isSTCFNFont )
-            {
-                for( int i = 0; i < data.mWidth; i++ )
-                {
-                    for( int j = 0; j < data.mHeight; j++ )
-                    {
-                        uint8_t* pix =
-                            &data.mBuffer[ 4 *
-                                           ( i * static_cast< uint64_t >( data.mHeight ) + j ) ];
-                        const uint8_t gray = std::max( pix[ 0 ], std::max( pix[ 1 ], pix[ 2 ] ) );
-                        pix[ 0 ] = pix[ 1 ] = pix[ 2 ] = gray;
-                    }
-                }
-            }
-        };
-        auto calculateAlphaIfNeed = []( FTextureBuffer& data, bool redIsAlpha ) {
-            if( redIsAlpha )
-            {
-                for( int i = 0; i < data.mWidth; i++ )
-                {
-                    for( int j = 0; j < data.mHeight; j++ )
-                    {
-                        uint8_t* pix =
-                            &data.mBuffer[ 4 *
-                                           ( i * static_cast< uint64_t >( data.mHeight ) + j ) ];
-
-                        // alpha = red
-                        pix[ 3 ] = pix[ 0 ];
-                    }
-                }
-            }
-        };
-
-        if( m_created )
-        {
-            return;
-        }
-
-        m_created = true;
-        m_name    = MakeTextureName( src );
-        if( RT_IsExplicitLavaFlatTexture( m_name.c_str() ) )
-        {
-            m_classic_name = m_name;
-            for( char& ch : m_classic_name )
-            {
-                ch = static_cast< char >( std::tolower( static_cast< unsigned char >( ch ) ) );
-            }
-        }
-
-        if( m_name.empty() || !src.GetTexture() )
-        {
-            assert( 0 );
-            return;
-        }
-
-        auto texbuffer = src.GetTexture()->CreateTexBuffer( translation, flags | CTF_ProcessData );
-        desaturateIfNeed( texbuffer, flags, fileSystem.GetFileShortName( src.GetSourceLump() ) );
-        calculateAlphaIfNeed( texbuffer, renderStyle.Flags & STYLEF_RedIsAlpha );
-
-        if( texbuffer.mWidth <= 0 || texbuffer.mHeight <= 0 )
-        {
-            assert( 0 );
-            return;
-        }
-
-        const bool exportseparately = m_name.starts_with( "vx_" );
-
-        auto details = RgOriginalTextureDetailsEXT{
-            .sType  = RG_STRUCTURE_TYPE_ORIGINAL_TEXTURE_DETAILS_EXT,
-            .pNext  = nullptr,
-            .flags  = exportseparately ? RG_ORIGINAL_TEXTURE_INFO_FORCE_EXPORT_AS_EXTERNAL : 0u,
-            .format = flags & CTF_Indexed ? RG_FORMAT_R8_SRGB : RG_FORMAT_B8G8R8A8_SRGB,
-        };
-
-        auto info = RgOriginalTextureInfo{
-            .sType        = RG_STRUCTURE_TYPE_ORIGINAL_TEXTURE_INFO,
-            .pNext        = &details,
-            .pTextureName = m_name.c_str(),
-            .pPixels      = texbuffer.mBuffer,
-            .size         = { static_cast< uint32_t >( texbuffer.mWidth ),
-                              static_cast< uint32_t >( texbuffer.mHeight ) },
-            .filter       = RG_SAMPLER_FILTER_AUTO,
-            .addressModeU = RG_SAMPLER_ADDRESS_MODE_REPEAT, //  rtclamp_x( clampmode ),
-            .addressModeV = RG_SAMPLER_ADDRESS_MODE_REPEAT, //  rtclamp_y( clampmode ),
-        };
-
-        RgResult r = rt.rgProvideOriginalTexture( &info );
-        RG_CHECK( r );
-
-        if( !m_classic_name.empty() )
-        {
-            info.pTextureName = m_classic_name.c_str();
-
-            r = rt.rgProvideOriginalTexture( &info );
-            RG_CHECK( r );
-        }
-    }
-
-    ~RTHardwareTexture() override
-    {
-// HACKHACK: TODO: why this is being called only on Release? (and destroying actually used textures)
-#if 0
-        RgResult r = rt.rgMarkOriginalTextureAsDeleted( m_name.c_str() );
-        RG_CHECK( r );
-#endif
-    }
-
-    auto GetRTName() const -> const char*
-    {
-        return m_created && !m_name.empty() ? m_name.c_str() : nullptr;
-    }
-
-    auto GetRTClassicName() const -> const char*
-    {
-        return m_created && !m_classic_name.empty() ? m_classic_name.c_str() : nullptr;
-    }
-
-private:
-    static auto MakeTextureName( FGameTexture& fgametex ) -> std::string
-    {
-        // highest priority: FGameTexture name
-        if( !fgametex.GetName().IsEmpty() )
-        {
-            const char* name = fgametex.GetName().GetChars();
-            if( const char* canonical = RT_CanonicalExplicitLavaFlatTexture( name ) )
-            {
-                return canonical;
-            }
-            return name;
-        }
-
-        // if no lump name, stringify the image ID;
-        // this is undesirable for textures that require a replacement
-        // (which are found by texname; and because ID is assigned at runtime,
-        // replacements can't be found correctly)
-        if( FTexture* ftex = fgametex.GetTexture() )
-        {
-            if( FImageSource* imgsrc = ftex->GetImage() )
-            {
-                // MSVC's std::string has 16 chars inlined,
-                // so no allocation should happen
-                return std::to_string( imgsrc->GetId() );
-            }
-        }
-
-        assert( 0 );
-        return {};
-    }
-
-private:
-    bool        m_created{ false };
-    std::string m_name{};
-    std::string m_classic_name{};
-};
-
-
-template< typename T >
-void ApplyMat33ToVec3_row( const T row_mat[ 3 ][ 3 ], float ( &v )[ 3 ] )
-{
-    RgFloat3D r;
-    for( int i = 0; i < 3; i++ )
-    {
-        r.data[ i ] = row_mat[ i ][ 0 ] * T( v[ 0 ] ) + row_mat[ i ][ 1 ] * T( v[ 1 ] ) +
-                      row_mat[ i ][ 2 ] * T( v[ 2 ] );
-    }
-    v[ 0 ] = r.data[ 0 ];
-    v[ 1 ] = r.data[ 1 ];
-    v[ 2 ] = r.data[ 2 ];
 }
 
-template< typename T >
-RgFloat4D ApplyMat44ToVec4( const T column_mat[ 4 ][ 4 ], const RgFloat4D& vs )
+void RT_SkyPrimsEndFrame()
 {
-    const auto* v = vs.data;
-    RgFloat4D   r;
-    for( int i = 0; i < 4; i++ )
-    {
-        r.data[ i ] = column_mat[ 0 ][ i ] * T( v[ 0 ] ) + column_mat[ 1 ][ i ] * T( v[ 1 ] ) +
-                      column_mat[ 2 ][ i ] * T( v[ 2 ] ) + column_mat[ 3 ][ i ] * T( v[ 3 ] );
-    }
-    return r;
+    g_skyprims_prev.swap( g_skyprims );
+    g_skyprims.clear();
 }
 
-template< typename T >
-RgFloat4D ApplyMat44ToVec4( const T* column_mat, const RgFloat4D& vs )
+// Defined below (global namespace); RT_Print in the anonymous namespace needs it.
+extern std::atomic< HWND > g_msgbox_parent;
+
+namespace
 {
-    return ApplyMat44ToVec4< T >( reinterpret_cast< const T( * )[ 4 ] >( column_mat ), vs );
-}
 
-RgFloat3D FromHomogeneous( const RgFloat4D& v )
-{
-    return RgFloat3D{ v.data[ 0 ] / v.data[ 3 ],
-                      v.data[ 1 ] / v.data[ 3 ],
-                      v.data[ 2 ] / v.data[ 3 ] };
-}
+// RG_CHECK, ONEGAMEUNIT_IN_METERS, RT_SectorHue, the light-ID bases and the rest
+// of the shared internals now live in rt_internal.h so the feature files split
+// out of here can see them too. Pulled in unqualified so nothing below changed.
+using namespace rtx;
 
-class RTRenderState : public FRenderState
-{
-public:
-    explicit RTRenderState( RTFrameBuffer* parent ) : m_fb( parent ) {}
-    virtual ~RTRenderState() = default;
 
-    void RT_BeginFrame()
-    {
-        rtstate.reset();
-        m_weaponDrawCallIndex = 0;
-    }
 
-    bool IsCurrentDrawIgnored() const
-    {
-        return rtstate.is< RtPrim::Ignored >() || mTextureMode == TM_FOGLAYER;
-    }
 
-    bool IsSpectre() const
-    {
-        switch( mRenderStyle.BlendOp )
-        {
-            case STYLEOP_Fuzz:
-            case STYLEOP_FuzzOrAdd:
-            case STYLEOP_FuzzOrSub:
-            case STYLEOP_FuzzOrRevSub:
-            case STYLEOP_Shadow: return true;
-            default: return false;
-        }
-    }
+// RT_BIT, the powerup flags and the colour/gamma helpers moved to rt_internal.h,
+// so rt_buffers.h and the split draw path can see them.
 
-    void Draw( int dt, int index, int count, bool apply = true ) override
-    {
-        if( IsCurrentDrawIgnored() )
-        {
-            return;
-        }
 
-        assert( count > 0 );
 
-        const uint32_t* pIndices   = nullptr;
-        uint32_t        indexCount = 0;
 
-        bool islines = false;
+// VectorAsBuffer, RTVertexBuffer, RTIndexBuffer and RTHardwareTexture moved to
+// rt_buffers.h, included at the top. RTDataBuffer stays below: it reads the
+// viewpoint matrices off RTRenderState, so it has to follow that class.
 
-        switch( dt )
-        {
-            case DT_Points: assert( 0 ); return;
-            case DT_Lines: islines = true; break;
-            case DT_Triangles:
-                // indices are sequential, just use vertex array
-                break;
-            case DT_TriangleFan:
-                rt.rgUtilScratchGetIndices(
-                    RG_UTIL_IM_SCRATCH_TOPOLOGY_TRIANGLE_FAN, count, &pIndices, &indexCount );
-                break;
-            case DT_TriangleStrip:
-                rt.rgUtilScratchGetIndices(
-                    RG_UTIL_IM_SCRATCH_TOPOLOGY_TRIANGLE_STRIP, count, &pIndices, &indexCount );
-                break;
-            default: break;
-        }
 
-        auto vb = static_cast< RTVertexBuffer* >( mVertexBuffer );
-        if( !vb )
-        {
-            assert( 0 );
-            return;
-        }
-        assert( rtstate.is< RtPrim::Sky >() == vb->IsSky() );
+// The matrix helpers moved to rt_internal.h -- rt_draw.cpp needs them.
 
-        InternalDraw( vb->AccessFormatted( mVertexOffsets[ 0 ] + index, count ),
-                      std::span{ pIndices, indexCount },
-                      vb->IsUI(),
-                      islines );
-    }
-
-    void DrawIndexed( int dt, int index, int count, bool apply = true ) override
-    {
-        if( IsCurrentDrawIgnored() )
-        {
-            return;
-        }
-
-        assert( dt == DT_Triangles );
-        if( count <= 0 )
-        {
-            // E3M2 fails
-            return;
-        }
-
-        auto vb = static_cast< RTVertexBuffer* >( mVertexBuffer );
-        if( !vb )
-        {
-            assert( 0 );
-            return;
-        }
-        assert( rtstate.is< RtPrim::Sky >() == vb->IsSky() );
-
-        auto ib = static_cast< RTIndexBuffer* >( mIndexBuffer );
-        if( !ib )
-        {
-            assert( 0 );
-            return;
-        }
-
-        auto indices = ib->AccessFormatted( index, count );
-
-        auto [ vertFirst, vertCount ] = RTIndexBuffer::CalcFirstVertexAndVertexCount( indices );
-
-        InternalDraw( vb->AccessFormatted( mVertexOffsets[ 0 ] + vertFirst, vertCount ),
-                      ib->MakeWithNewFirstIndex( indices, vertFirst ),
-                      vb->IsUI() );
-    }
-
-    void ClearScreen() override {}
-    bool SetDepthClamp( bool on ) override { return on; }
-    void SetDepthMask( bool on ) override {}
-    void SetDepthFunc( int func ) override {}
-    void SetDepthRange( float min, float max ) override {}
-    void SetColorMask( bool r, bool g, bool b, bool a ) override {}
-    void SetStencil( int offs, int op, int flags = -1 ) override {}
-    void SetCulling( int mode ) override {}
-    void EnableClipDistance( int num, bool state ) override {}
-    void Clear( int targets ) override {}
-    void EnableStencil( bool on ) override {}
-    void SetScissor( int x, int y, int w, int h ) override {}
-    void SetViewport( int x, int y, int w, int h ) override
-    {
-        m_viewport = RgViewport{
-            .x        = float( x ),
-            .y        = float( y ),
-            .width    = float( w ),
-            .height   = float( h ),
-            .minDepth = 0.0f,
-            .maxDepth = 1.0f,
-        };
-    }
-    void EnableDepthTest( bool on ) override {}
-    void EnableMultisampling( bool on ) override {}
-    void EnableLineSmooth( bool on ) override {}
-    void EnableDrawBuffers( int count, bool apply ) override {}
-
-private:
-    static bool IsPerspectiveMatrix( const float* m );
-    static bool IsLikeIdentity( const float* m );
-    static bool IsLikeIdentity( const double* m );
-
-    // If need to calculate a transform at the sprite's bottom.
-    bool RequiresTrueTransform() const
-    {
-        if( rtstate.is< RtPrim::ExportInstance >() )
-        {
-            // need to make a true one, since gzdoom doesn't provide a world transform
-            return !mModelMatrixEnabled;
-        }
-        return false;
-    }
-
-    auto CalculateTrueTransformAndItsVerts( std::span< const RgPrimitiveVertex > originalVerts )
-        -> std::pair< RgTransform, std::span< const RgPrimitiveVertex > >
-    {
-        assert( RequiresTrueTransform() );
-        assert( originalVerts.size() == 4 ); // to find a non-sprite without model matrix
-        assert( !mModelMatrixEnabled );      // means that vert positions are in a metric space
-
-        // need to offset a bit, to prevent clipping with floor (for glass spectres)
-        constexpr float CLIP_FIX_OFFSET = 0.005f;
-
-        const float pivot[] = {
-            rtstate.m_lastthingposition.X * ONEGAMEUNIT_IN_METERS,
-            rtstate.m_lastthingposition.Y * ONEGAMEUNIT_IN_METERS,
-            rtstate.m_lastthingposition.Z * ONEGAMEUNIT_IN_METERS + CLIP_FIX_OFFSET,
-        };
-
-        m_tempverts.clear();
-        m_tempverts.assign( originalVerts.begin(), originalVerts.end() );
-
-        // make relative to pivot
-        for( uint32_t v = 0; v < originalVerts.size(); v++ )
-        {
-            m_tempverts[ v ].position[ 0 ] -= pivot[ 0 ];
-            m_tempverts[ v ].position[ 1 ] -= pivot[ 1 ];
-            m_tempverts[ v ].position[ 2 ] -= pivot[ 2 ];
-        }
-
-        // un-rotate the angle
-        const auto [ pitch, yaw ] = rtstate.get_spriterotation();
-        
-#if 0 // reference
-        Matrix3x4 m;
-        m.MakeIdentity();
-        m.Rotate( 0, 0, 1, to_deg( yaw ) );
-        m.Rotate( 0, 1, 0, to_deg( pitch ) );
-#else
-        const float cos_pitch = std::cos( pitch );
-        const float sin_pitch = std::sin( pitch );
-        const float cos_yaw   = std::cos( yaw );
-        const float sin_yaw   = std::sin( yaw );
-
-        //     |  cos_pitch, 0, sin_pitch |   | cos_yaw, -sin_yaw, 0 |
-        // m = |          0, 1,         0 | x | sin_yaw,  cos_yaw, 0 |
-        //     | -sin_pitch, 0, cos_pitch |   |       0,       0,  1 |
-
-        float m[ 3 ][ 3 ] = {
-            { cos_yaw * cos_pitch, -sin_yaw, cos_yaw * sin_pitch },
-            { sin_yaw * cos_pitch, cos_yaw, sin_yaw * sin_pitch },
-            { -sin_pitch, 0, cos_pitch },
-        };
-#endif
-        const float m_inv[ 3 ][ 3 ] = {
-            { m[ 0 ][ 0 ], m[ 1 ][ 0 ], m[ 2 ][ 0 ] },
-            { m[ 0 ][ 1 ], m[ 1 ][ 1 ], m[ 2 ][ 1 ] },
-            { m[ 0 ][ 2 ], m[ 1 ][ 2 ], m[ 2 ][ 2 ] },
-        };
-        for( auto& v : m_tempverts )
-        {
-            ApplyMat33ToVec3_row( m_inv, v.position );
-        }
-
-        return {
-            RgTransform{ {
-                { m[ 0 ][ 0 ], m[ 0 ][ 1 ], m[ 0 ][ 2 ], pivot[ 0 ] },
-                { m[ 1 ][ 0 ], m[ 1 ][ 1 ], m[ 1 ][ 2 ], pivot[ 1 ] },
-                { m[ 2 ][ 0 ], m[ 2 ][ 1 ], m[ 2 ][ 2 ], pivot[ 2 ] },
-            } },
-            std::span{ m_tempverts },
-        };
-    }
-
-    auto MakeTransform( bool isSky ) const -> RgTransform
-    {
-        assert( !RequiresTrueTransform() );
-
-        // also converts to metric
-        auto fromGzMatrix = []( const float* m ) {
-            return RgTransform{ {
-                { m[ 0 ], m[ 4 ], m[ 8 ], m[ 12 ] * ONEGAMEUNIT_IN_METERS },
-                { m[ 1 ], m[ 5 ], m[ 9 ], m[ 13 ] * ONEGAMEUNIT_IN_METERS },
-                { m[ 2 ], m[ 6 ], m[ 10 ], m[ 14 ] * ONEGAMEUNIT_IN_METERS },
-            } };
-        };
-
-        // sky has view matrix that is different from main camera, apply it
-        if( isSky )
-        {
-            auto l_unit = []( float f ) {
-                return f > +0.5f   ? +1.0f //
-                       : f < -0.5f ? -1.0f //
-                                   : 0.0f;
-            };
-
-            auto skyToMainCameraIrregular =
-                VSMatrix::smultMatrix( m_mainCameraView_Inverse, m_view );
-
-            const float* irr = skyToMainCameraIrregular.get();
-
-            const float skyToMainCamera[ 16 ] = {
-                l_unit( irr[ 0 ] ), l_unit( irr[ 1 ] ), l_unit( irr[ 2 ] ),  0,
-                l_unit( irr[ 4 ] ), l_unit( irr[ 5 ] ), l_unit( irr[ 6 ] ),  0,
-                l_unit( irr[ 8 ] ), l_unit( irr[ 9 ] ), l_unit( irr[ 10 ] ), 0,
-                irr[ 12 ],          irr[ 13 ],          irr[ 14 ],           1,
-            };
-
-            auto skyTransform = mModelMatrix;
-            skyTransform.scale( 1, cvar::rt_sky_stretch, 1 );
-
-            auto t = VSMatrix::smultMatrix( skyToMainCamera, skyTransform.get() );
-            return fromGzMatrix( t.get() );
-        }
-
-        if( mModelMatrixEnabled )
-        {
-            return fromGzMatrix( mModelMatrix.get() );
-        }
-
-        return RG_TRANSFORM_IDENTITY;
-    }
-
-    auto MapLightLevel( int lightlevel ) -> float
-    {
-        assert( lightlevel <= 255 );
-        int lmin = std::max< int >( cvar::rt_lightlevel_min, 0 );
-        int lmax = std::min< int >( cvar::rt_lightlevel_max, 255 );
-
-        if( lmin >= lmax )
-        {
-            return 0.0f;
-        }
-        if( lightlevel <= lmin )
-        {
-            return 0.0f;
-        }
-        if( lightlevel >= lmax )
-        {
-            return 1.0f;
-        }
-        float t = float( lightlevel - lmin ) / float( lmax - lmin );
-
-        if( std::abs( cvar::rt_lightlevel_exp - 2.f ) < 0.01f )
-        {
-            return t * t;
-        }
-        if( std::abs( cvar::rt_lightlevel_exp - 1.f ) < 0.01f )
-        {
-            return t;
-        }
-        return std::pow( t, cvar::rt_lightlevel_exp );
-    }
-
-    auto MakeFirstPersonQuadInWorldSpace( std::span< const RgPrimitiveVertex > verts )
-        -> std::pair< RgTransform, std::span< const RgPrimitiveVertex > >
-    {
-        if( verts.size() != 4 )
-        {
-            // assert( 0 );
-            return { RgTransform{ RG_TRANSFORM_IDENTITY }, verts };
-        }
-
-        const auto  priority = m_weaponDrawCallIndex++;
-        const float z        = 0.1f / float( 1 + priority );
-
-        auto toPix = []( const RgPrimitiveVertex& vert ) {
-            // because of MakeFormatted...
-            return RgFloat2D{
-                vert.position[ 0 ] / ONEGAMEUNIT_IN_METERS,
-                vert.position[ 2 ] / ONEGAMEUNIT_IN_METERS,
-            };
-        };
-
-        auto applyViewport = []( const RgViewport& vp, const RgFloat2D& vert ) {
-            return RgFloat2D{
-                vert.data[ 0 ] / float( vp.width ),
-                vert.data[ 1 ] / float( vp.height ),
-            };
-        };
-
-        // screen space [0,1]
-        RgFloat2D scr01[] = {
-            applyViewport( m_viewport, toPix( verts[ 0 ] ) ),
-            applyViewport( m_viewport, toPix( verts[ 1 ] ) ),
-            applyViewport( m_viewport, toPix( verts[ 2 ] ) ),
-            applyViewport( m_viewport, toPix( verts[ 3 ] ) ),
-        };
-
-        // remap [0,1] to [-1,1] clip space
-        RgFloat4D clipspace[] = {
-            RgFloat4D{ scr01[ 0 ].data[ 0 ] * 2 - 1, scr01[ 0 ].data[ 1 ] * 2 - 1, z, 1.0f },
-            RgFloat4D{ scr01[ 1 ].data[ 0 ] * 2 - 1, scr01[ 1 ].data[ 1 ] * 2 - 1, z, 1.0f },
-            RgFloat4D{ scr01[ 2 ].data[ 0 ] * 2 - 1, scr01[ 2 ].data[ 1 ] * 2 - 1, z, 1.0f },
-            RgFloat4D{ scr01[ 3 ].data[ 0 ] * 2 - 1, scr01[ 3 ].data[ 1 ] * 2 - 1, z, 1.0f },
-        };
-
-        // inverse projection to transform clip space -> view space
-        RgFloat4D viewspace[] = {
-            ApplyMat44ToVec4( m_mainCameraProjection_Inverse, clipspace[ 0 ] ),
-            ApplyMat44ToVec4( m_mainCameraProjection_Inverse, clipspace[ 1 ] ),
-            ApplyMat44ToVec4( m_mainCameraProjection_Inverse, clipspace[ 2 ] ),
-            ApplyMat44ToVec4( m_mainCameraProjection_Inverse, clipspace[ 3 ] ),
-        };
-
-#if 0
-        // inverse view to transform view space -> world space
-        RgFloat3D worldspace[] = {
-            FromHomogeneous( ApplyMat44ToVec4( m_mainCameraView_Inverse, viewspace[ 0 ] ) ),
-            FromHomogeneous( ApplyMat44ToVec4( m_mainCameraView_Inverse, viewspace[ 1 ] ) ),
-            FromHomogeneous( ApplyMat44ToVec4( m_mainCameraView_Inverse, viewspace[ 2 ] ) ),
-            FromHomogeneous( ApplyMat44ToVec4( m_mainCameraView_Inverse, viewspace[ 3 ] ) ),
-        };
-
-        m_tempverts.clear();
-        m_tempverts.assign( verts.begin(), verts.end() );
-        for( uint32_t i = 0; i < std::size( worldspace ); i++ )
-        {
-            // because of m_mainCameraView_Inverse, m_mainCameraProjection_Inverse,
-            // vi_world already have ONEGAMEUNIT_IN_METERS applied
-            m_tempverts[ i ].position[ 0 ] = worldspace[ i ].data[ 0 ];
-            m_tempverts[ i ].position[ 1 ] = worldspace[ i ].data[ 1 ];
-            m_tempverts[ i ].position[ 2 ] = worldspace[ i ].data[ 2 ];
-        }
-        return m_tempverts;
-#else
-
-        // treat m_mainCameraView_Inverse as the transform
-        const float* t = m_mainCameraView_Inverse;
-        
-        auto transform = RgTransform{ {
-            { t[ 0 ], t[ 4 ], t[ 8 ], t[ 12 ] },
-            { t[ 1 ], t[ 5 ], t[ 9 ], t[ 13 ] },
-            { t[ 2 ], t[ 6 ], t[ 10 ], t[ 14 ] },
-        } };
-
-        m_tempverts.clear();
-        m_tempverts.assign( verts.begin(), verts.end() );
-        for( uint32_t i = 0; i < std::size( viewspace ); i++ )
-        {
-            double w = viewspace[ i ].data[ 3 ];
-            w        = std::max( w, 0.00000001 );
-
-            // because of m_mainCameraView_Inverse, m_mainCameraProjection_Inverse,
-            // vi_world already have ONEGAMEUNIT_IN_METERS applied
-            m_tempverts[ i ].position[ 0 ] = float( viewspace[ i ].data[ 0 ] / w );
-            m_tempverts[ i ].position[ 1 ] = float( viewspace[ i ].data[ 1 ] / w );
-            m_tempverts[ i ].position[ 2 ] = float( viewspace[ i ].data[ 2 ] / w );
-        }
-        return { transform, m_tempverts };
-#endif
-    }
-
-    void InternalDraw( std::span< const RgPrimitiveVertex > verts,
-                       std::span< const uint32_t >          indices,
-                       const bool                           isUI,
-                       const bool                           islines = false )
-    {
-        assert( RG_PACKED_COLOR_WHITE == rt.rgUtilPackColorByte4D( 255, 255, 255, 255 ) );
-
-        if( islines && !isUI )
-        {
-            assert( 0 );
-            return;
-        }
-
-        if( verts.empty() )
-        {
-            assert( 0 );
-            return;
-        }
-
-        const bool  fullClassicMode = !RT_ForceNoClassicMode() && float( cvar::rt_classic ) >= 0.999f;
-        const char* texname         = nullptr;
-        if( mTextureEnabled && mMaterial.mMaterial )
-        {
-            if( FGameTexture* gametex = mMaterial.mMaterial->sourcetex )
-            {
-                if( FTexture* base = gametex->GetTexture() )
-                {
-                    if( auto hwtex = static_cast< RTHardwareTexture* >( base->GetHardwareTexture(
-                            mMaterial.mTranslation, mMaterial.mMaterial->GetScaleFlags() ) ) )
-                    {
-                        hwtex->CreateIfWasnt( *gametex,
-                                              mMaterial.mClampMode,
-                                              mMaterial.mTranslation,
-                                              mMaterial.mMaterial->GetScaleFlags(),
-                                              mRenderStyle );
-                        texname = fullClassicMode && hwtex->GetRTClassicName()
-                                      ? hwtex->GetRTClassicName()
-                                      : hwtex->GetRTName();
-                    }
-                }
-            }
-        }
-
-        if( !texname && !isUI && !rtstate.is< RtPrim::Sky >() &&
-            !rtstate.is< RtPrim::SkyVisibility >() )
-        {
-            // assert( 0 );
-        }
-
-        // TODO: apply texture matrix on gpu
-        if( mTextureMatrixEnabled )
-        {
-            m_tempverts.clear();
-            m_tempverts.assign( verts.begin(), verts.end() );
-
-            auto applyTexMatrix = [ & ]( float u, float v ) {
-                auto m = [ & ]( int i, int j ) {
-                    return mTextureMatrix.get()[ i + j * 4 ];
-                };
-
-                return std::pair{
-                    m( 0, 0 ) * u + m( 1, 0 ) * v,
-                    m( 0, 1 ) * u + m( 1, 1 ) * v,
-                };
-            };
-
-            for( RgPrimitiveVertex& v : m_tempverts )
-            {
-                std::tie( v.texCoord[ 0 ], v.texCoord[ 1 ] ) =
-                    applyTexMatrix( v.texCoord[ 0 ], v.texCoord[ 1 ] );
-            }
-
-            verts = m_tempverts;
-        }
-
-        if( rtstate.is< RtPrim::Sky >() && texname )
-        {
-            m_fb->RT_MarkWasSky();
-        }
-
-        RgTransform transform;
-        if( rtstate.is< RtPrim::FirstPerson >() )
-        {
-            std::tie( transform, verts ) = MakeFirstPersonQuadInWorldSpace( verts );
-        }
-        else if( RequiresTrueTransform() )
-        {
-            std::tie( transform, verts ) = CalculateTrueTransformAndItsVerts( verts );
-        }
-        else
-        {
-            transform = MakeTransform( rtstate.is< RtPrim::Sky >() );
-        }
-
-        const bool forceLavaFloorTexture =
-            !fullClassicMode && RT_ShouldForceLavaFloorTexture( texname );
-
-        auto ui = RgMeshPrimitiveSwapchainedEXT{
-            .sType       = RG_STRUCTURE_TYPE_MESH_PRIMITIVE_SWAPCHAINED_EXT,
-            .pNext       = nullptr,
-            .flags       = islines ? uint32_t{ RG_MESH_PRIMITIVE_SWAPCHAINED_DRAW_AS_LINES } : 0,
-            .pViewport   = &m_viewport,
-            .pView       = m_view,
-            .pProjection = m_projection,
-            .pViewProjection = nullptr,
-        };
-
-        auto l_makeInstanceFlags = [ & ]() -> RgMeshInfoFlags {
-            if( rtstate.is< RtPrim::FirstPersonViewer >() )
-            {
-                return RG_MESH_FIRST_PERSON_VIEWER;
-            }
-            if( rtstate.is< RtPrim::FirstPerson >() )
-            {
-                return RG_MESH_FIRST_PERSON;
-            }
-            return 0;
-        };
-
-        auto l_makeSpectreFlags = [ & ]() -> RgMeshInfoFlags {
-            if( IsSpectre() )
-            {
-                bool firstperson = rtstate.is< RtPrim::FirstPersonViewer >() ||
-                                   rtstate.is< RtPrim::FirstPerson >();
-
-                // suppress inter-reflection on spectres
-                RgMeshInfoFlags fs = firstperson ? 0 : RG_MESH_FORCE_IGNORE_REFRACT_AFTER;
-
-                int mode = firstperson ? *cvar::rt_spectre_invis1 : *cvar::rt_spectre;
-                switch( mode )
-                {
-                    case 1: return fs | RG_MESH_FORCE_GLASS;
-                    case 2: return fs | RG_MESH_FORCE_MIRROR;
-                    default: return fs | RG_MESH_FORCE_WATER;
-                }
-            }
-            return 0;
-        };
-
-        auto mesh = RgMeshInfo{
-            .sType = RG_STRUCTURE_TYPE_MESH_INFO,
-            .pNext = nullptr,
-            .flags =
-                l_makeInstanceFlags() | l_makeSpectreFlags() |
-                ( rtstate.is< RtPrim::ExportInstance >() ? RG_MESH_EXPORT_AS_SEPARATE_FILE : 0 ),
-            .uniqueObjectID = rtstate.get_uniqueid(),
-            .pMeshName      = rtstate.is< RtPrim::ExportMap >() ? RT_GetMapName()
-                              : rtstate.is< RtPrim::ExportInstance >()
-                                  ? rtstate.get_exportinstance_name()
-                                  : nullptr,
-            .transform      = transform,
-            .isExportable =
-                rtstate.is< RtPrim::ExportMap >() || rtstate.is< RtPrim::ExportInstance >(),
-            .animationTime        = 0.0f,
-            .localLightsIntensity = MapLightLevel( rtstate.m_lightlevel ),
-        };
-
-        auto makePrimFlags = [ this, &verts, forceLavaFloorTexture ]( bool isUI ) -> RgMeshPrimitiveFlags {
-            if( isUI )
-            {
-                return RG_MESH_PRIMITIVE_TRANSLUCENT;
-            }
-            if( rtstate.is< RtPrim::Decal >() )
-            {
-                assert( verts.size() == 4 );
-                return RG_MESH_PRIMITIVE_DECAL;
-            }
-            if( rtstate.is< RtPrim::SkyVisibility >() )
-            {
-                return RG_MESH_PRIMITIVE_SKY_VISIBILITY;
-            }
-            if( rtstate.is< RtPrim::Sky >() )
-            {
-                return RG_MESH_PRIMITIVE_SKY | RG_MESH_PRIMITIVE_TRANSLUCENT;
-            }
-            if( rtstate.is< RtPrim::Particle >() )
-            {
-                return RG_MESH_PRIMITIVE_TRANSLUCENT;
-            }
-            if( rtstate.is< RtPrim::Mirror >() )
-            {
-                return RG_MESH_PRIMITIVE_MIRROR;
-            }
-            if( rtstate.is< RtPrim::Glass >() )
-            {
-                return RG_MESH_PRIMITIVE_GLASS;
-            }
-            if( forceLavaFloorTexture )
-            {
-                return RG_MESH_PRIMITIVE_WATER;
-            }
-
-            RgMeshPrimitiveFlags add;
-            switch( int( cvar::rt_wall_nomv ) )
-            {
-                case 0: add = 0; break;
-                case 2: add = RG_MESH_PRIMITIVE_NO_MOTION_VECTORS; break;
-                default:
-                    add = rtstate.is< RtPrim::NoMotionVectors >()
-                              ? RG_MESH_PRIMITIVE_NO_MOTION_VECTORS
-                              : 0;
-                    break;
-            }
-
-            return ( mAlphaThreshold > 0 ? RG_MESH_PRIMITIVE_ALPHA_TESTED : 0 ) | add;
-        };
-
-        // HACKHACK: replacements are ignored if a prim is rasterized, force alpha=1.0
-        const bool forcealpha1 = ( mesh.flags & RG_MESH_FORCE_GLASS ) ||
-                                 ( mesh.flags & RG_MESH_FORCE_MIRROR ) ||
-                                 ( mesh.flags & RG_MESH_FORCE_WATER ) ||
-                                 forceLavaFloorTexture;
-
-        auto prim = RgMeshPrimitiveInfo{
-            .sType = RG_STRUCTURE_TYPE_MESH_PRIMITIVE_INFO,
-            .pNext = isUI ? &ui : nullptr,
-            .flags = makePrimFlags( isUI ) | RG_MESH_PRIMITIVE_FORCE_EXACT_NORMALS |
-                     ( rtstate.is< RtPrim::ExportInvertNormals >()
-                           ? RG_MESH_PRIMITIVE_EXPORT_INVERT_NORMALS
-                           : 0 ),
-            .primitiveIndexInMesh = rtstate.next_primitiveindex(),
-            .pVertices            = verts.data(),
-            .vertexCount          = static_cast< uint32_t >( verts.size() ),
-            .pIndices             = indices.empty() ? nullptr : indices.data(),
-            .indexCount           = static_cast< uint32_t >( indices.size() ),
-            .pTextureName         = texname,
-            .textureFrame         = 0,
-            .color =
-                rtcolor_multiply( mStreamData.uObjectColor, mStreamData.uVertexColor, forcealpha1 ),
-            .emissive =
-                forceLavaFloorTexture
-                    ? 1.0f
-                    : ( ( mRenderStyle.BlendOp == STYLEOP_Add &&
-                          mRenderStyle.DestAlpha == STYLEALPHA_One )
-                            ? cvar::rt_emis_additive_dflt
-                            : 0.f ),
-            .classicLight = lightlevel_to_classic( isUI, mLightParms[ 3 ] ),
-        };
-
-#ifndef NDEBUG
-        if( cvar::_rt_showexportable )
-        {
-            if( !rtstate.is< RtPrim::ExportMap >() && !isUI )
-            {
-                return;
-            }
-        }
-#endif
-
-        RgResult r = rt.rgUploadMeshPrimitive( &mesh, &prim );
-        RG_CHECK( r );
-    }
-
-public:
-    void RT_SetMatrices( const VSMatrix& view, const VSMatrix& proj )
-    {
-        // TODO: only calculate when UI mode;
-        //       can those UI elements be with perspective matrix?
-
-        // clang-format off
-        constexpr static float vkcorrection[] = {
-            1,  0,    0, 0,
-            0, -1,    0, 0,
-            0,  0, 0.5f, 0,
-            0,  0, 0.5f, 1,
-        };
-        // clang-format on
-
-        auto correctedProj = VSMatrix::smultMatrix( vkcorrection, proj.get() );
-        memcpy( m_projection, correctedProj.get(), sizeof( float ) * 16 );
-        memcpy( m_view, view.get(), sizeof( float ) * 16 );
-    }
-
-    void RT_AddMainCamera( const FRenderViewpoint& viewpoint )
-    {
-        const auto [ up, right, forward ] = RT_MakeUpRightForwardVectors( viewpoint.Angles );
-
-        const float pixelstretch =
-            viewpoint.ViewLevel ? viewpoint.ViewLevel->info->pixelstretch : 1.0f;
-
-        const auto aspectRatio = r_viewwindow.WidescreenRatio;
-        const auto fovRatio    = r_viewwindow.WidescreenRatio >= 1.3f ? 1.333333f : aspectRatio;
-
-        const auto fovy = static_cast< float >(
-            2.0 * std::atan( std::tan( viewpoint.FieldOfView.Radians() / 2.0 ) /
-                             static_cast< double >( fovRatio ) ) );
-
-
-        auto readback = RgCameraInfoReadbackEXT{
-            .sType = RG_STRUCTURE_TYPE_CAMERA_INFO_READ_BACK_EXT,
-        };
-
-        auto info = RgCameraInfo{
-            .sType       = RG_STRUCTURE_TYPE_CAMERA_INFO,
-            .pNext       = &readback,
-            .flags       = 0,
-            .position    = { float( viewpoint.Pos.X ) * ONEGAMEUNIT_IN_METERS,
-                             float( viewpoint.Pos.Y ) * ONEGAMEUNIT_IN_METERS,
-                             float( viewpoint.Pos.Z ) * ONEGAMEUNIT_IN_METERS },
-            .up          = up,
-            .right       = right,
-            .fovYRadians = fovy,
-            .aspect      = aspectRatio * pixelstretch,
-            .cameraNear  = cvar::rt_znear,
-            .cameraFar   = cvar::rt_zfar,
-        };
-
-        RgResult r = rt.rgUploadCamera( &info );
-        RG_CHECK( r );
-
-
-        // for first-person weapons
-        memcpy( m_mainCameraView_Inverse, readback.viewInverse, 16 * sizeof( float ) );
-        memcpy( m_mainCameraProjection_Inverse, readback.projectionInverse, 16 * sizeof( float ) );
-        static_assert( sizeof m_mainCameraView_Inverse == sizeof readback.viewInverse );
-        static_assert( sizeof m_mainCameraProjection_Inverse == sizeof readback.projectionInverse );
-
-
-        RT_AddFlashlight( info.position, forward, up, right );
-        RT_AddMuzzleFlash( viewpoint.ViewActor, viewpoint.extralight, info.position, forward, up );
-    }
-
-    void RT_AddFlashlight( const RgFloat3D& basePosition,
-                           const RgFloat3D& forward,
-                           const RgFloat3D& up,
-                           const RgFloat3D& right )
-    {
-        auto enabled = []() {
-            if( cvar::rt_pw_lightamp == 2 )
-            {
-                if( RT_CalcPowerupFlags() & RT_POWERUP_FLAG_FLASHLIGHT_BIT )
-                {
-                    return true;
-                }
-            }
-            if( cvar::rt_flsh )
-            {
-                return true;
-            }
-            return false;
-        };
-
-        if( !enabled() )
-        {
-            return;
-        }
-
-        auto pos = gzvec3( basePosition );
-        {
-            pos += gzvec3( up ) * cvar::rt_flsh_u;
-            pos += gzvec3( right ) * cvar::rt_flsh_r;
-            pos += gzvec3( forward ) * cvar::rt_flsh_f;
-        }
-
-        auto target = gzvec3( basePosition ) + 20 * gzvec3( forward );
-        auto dir    = ( target - pos ).Unit();
-
-        auto spot = RgLightSpotEXT{
-            .sType      = RG_STRUCTURE_TYPE_LIGHT_SPOT_EXT,
-            .pNext      = nullptr,
-            .color      = RG_PACKED_COLOR_WHITE,
-            .intensity  = cvar::rt_flsh_intensity,
-            .position   = { pos.X, pos.Y, pos.Z },
-            .direction  = { dir.X, dir.Y, dir.Z },
-            .radius     = cvar::rt_flsh_radius,
-            .angleOuter = to_rad( cvar::rt_flsh_angle ),
-            .angleInner = 0,
-        };
-
-        auto light = RgLightInfo{
-            .sType        = RG_STRUCTURE_TYPE_LIGHT_INFO,
-            .pNext        = &spot,
-            .uniqueID     = FlashlightLightId,
-            .isExportable = false,
-        };
-
-        RgResult r = rt.rgUploadLight( &light );
-        RG_CHECK( r );
-    }
-
-    void RT_AddMuzzleFlash( AActor*          viewactor,
-                            int              extralight,
-                            const RgFloat3D& basePosition,
-                            const RgFloat3D& forward,
-                            const RgFloat3D& up )
-    {
-        if( extralight <= 0 || !cvar::rt_mzlflsh || !viewactor || !viewactor->Sector )
-        {
-            return;
-        }
-
-        auto desiredPos = gzvec3( basePosition );
-        {
-            desiredPos += gzvec3( up ) * cvar::rt_mzlflsh_u;
-            desiredPos += gzvec3( forward ) * cvar::rt_mzlflsh_f;
-        }
-
-        FVector3 pos;
-        {
-            // metric to game units
-            auto units_desiredPos   = DVector3{ desiredPos } / double{ ONEGAMEUNIT_IN_METERS };
-            auto units_basePosition = gzvec3d( basePosition ) / double{ ONEGAMEUNIT_IN_METERS };
-
-            auto dir = units_desiredPos - units_basePosition;
-            auto len = dir.Length();
-
-            if( len > 0.01 )
-            {
-                dir /= len;
-
-                float hitT = 1.0f;
-
-                FTraceResults trace;
-                if( Trace( units_basePosition,
-                           viewactor->Sector,
-                           dir,
-                           len,
-                           0,
-                           0,
-                           viewactor,
-                           trace,
-                           TRACE_NoSky ) )
-                {
-                    if( trace.HitType != TRACE_HitNone )
-                    {
-                        hitT = float( ( trace.HitPos - units_basePosition ).Length() / len );
-                        // hit point must be between base and desired positions
-                        assert( hitT >= 0 && hitT <= 1 );
-                    }
-                }
-
-                hitT *= std::clamp( float( cvar::rt_mzlflsh_offset ), 0.0f, 1.0f );
-
-                // lerp
-                pos = gzvec3( basePosition ) + hitT * ( desiredPos - gzvec3( basePosition ) );
-            }
-            else
-            {
-                pos = gzvec3( basePosition );
-            }
-        }
-
-        auto sph = RgLightSphericalEXT{
-            .sType     = RG_STRUCTURE_TYPE_LIGHT_SPHERICAL_EXT,
-            .pNext     = nullptr,
-            .color     = cvarcolor_to_rtcolor( cvar::rt_mzlflsh_color ),
-            .intensity = cvar::rt_mzlflsh_intensity,
-            .position  = { pos.X, pos.Y, pos.Z },
-            .radius    = cvar::rt_mzlflsh_radius,
-        };
-
-        auto light = RgLightInfo{
-            .sType        = RG_STRUCTURE_TYPE_LIGHT_INFO,
-            .pNext        = &sph,
-            .uniqueID     = MuzzleFlashLightId,
-            .isExportable = false,
-        };
-
-        RgResult r = rt.rgUploadLight( &light );
-        RG_CHECK( r );
-    }
-
-private:
-    RgViewport m_viewport{};
-    float      m_view[ 16 ]{};
-    float      m_projection[ 16 ]{};
-
-    float m_mainCameraView_Inverse[ 16 ]{};
-    float m_mainCameraProjection_Inverse[ 16 ]{};
-
-    uint32_t m_weaponDrawCallIndex{ 0 }; // to z-sort weapon sprites
-
-    std::vector< RgPrimitiveVertex > m_tempverts{};
-
-public:
-    RTFrameBuffer* m_fb{ nullptr };
-};
+// RTFrameBuffer and RTRenderState moved to rt_renderstate.h, with their two
+// largest members split off into rt_draw.cpp (InternalDraw) and rt_weapon.cpp
+// (the first-person weapon lighting).
 
 
 
@@ -2151,7 +293,11 @@ void RT_Print( const char* pMessage, RgMessageSeverityFlags flags, void* pUserDa
 
     if( flags & RG_MESSAGE_SEVERITY_ERROR )
     {
-        DPrintf( DMSG_ERROR, "%s\n", pMessage );
+        // Doom64-RT: Printf, not DPrintf. DPrintf(DMSG_ERROR) is silent unless
+        // `developer` >= 1, so a renderer error used to leave rt-console.log clean
+        // while the (owner-less) box below sat behind the game window -- which
+        // reads as a freeze. A renderer error must be visible in the log.
+        Printf( PRINT_HIGH, TEXTCOLOR_RED "RTGL1 error: %s\n", pMessage );
 
 #ifdef WIN32
         static bool g_breakOnError = true;
@@ -2165,7 +311,9 @@ void RT_Print( const char* pMessage, RgMessageSeverityFlags flags, void* pUserDa
                                     msg,
                                     msg.ends_with( '.' ) ? "" : "." );
 
-            int ok = MessageBoxA( nullptr,
+            // Owned by the game window like every other box in this file, so it
+            // comes up in front of the game instead of behind it.
+            int ok = MessageBoxA( g_msgbox_parent.load(),
                                   str.c_str(), // null-terminated
                                   "Renderer Error",
                                   MB_ABORTRETRYIGNORE | MB_DEFBUTTON2 | MB_ICONERROR );
@@ -2181,7 +329,65 @@ void RT_Print( const char* pMessage, RgMessageSeverityFlags flags, void* pUserDa
     }
     else if( flags & RG_MESSAGE_SEVERITY_WARNING )
     {
-        DPrintf( DMSG_WARNING, "%s\n", pMessage );
+        // Printf, not DPrintf: DPrintf( DMSG_WARNING, ... ) is additionally
+        // gated behind gzdoom's `developer` cvar being >= 2, which was a third
+        // independent layer of silence on top of RgInstanceCreateInfo::
+        // allowedMessages and RTGL's own g_printSeverity. Renderer warnings
+        // (DLSS-RR failing to initialise, denoiser path changing) must reach
+        // the console and the logfile unconditionally -- muting them by
+        // default is what hid the compiled-out-RR bug for an entire
+        // investigation.
+        //
+        // RT_DiagPrintLevel() adds PRINT_NONOTIFY under `rt_verbose 0` (the
+        // release default), which takes these off the on-screen notify overlay
+        // WITHOUT taking them out of the console buffer or the logfile -- so
+        // the reasoning above still holds, while a release build stops painting
+        // "Denoiser path: ...", "ReSTIR: initialSamples=..." and friends across
+        // the picture on every level load. One line, and it covers every
+        // message RTGL1 emits.
+        //
+        // De-duplicate identical CONSECUTIVE warnings. RTGL1 has no per-frame
+        // "say this once" concept of its own -- "No camera provided via API,
+        // nor through .gltf" is emitted from inside rgStartFrame/rgDrawFrame
+        // every single frame the engine fails to upload one, and the failure
+        // mode that hits that (I_Error unwinding out of a level -- see
+        // p_saveg.cpp's savegame-checksum check) does not resolve itself for
+        // many frames, so the naive Printf above turned into an unbounded
+        // flood: one line per frame, forever (measured ~10/sec), into both
+        // the console buffer and rt-console.log. This does not fix why the
+        // camera stopped coming in -- it only stops one warning from
+        // drowning the log while that happens.
+        //
+        // A pure "print once, then go silent until the text changes" would
+        // go silent FOREVER on a genuinely stuck repeat -- the text never
+        // changes, so the closing summary line never fires and a log tail
+        // reads as if nothing is happening. Cap the silence instead, but at a
+        // deliberately long interval -- this is "print once", not a
+        // heartbeat; the re-announce only exists so a session left running
+        // for a very long time still leaves a trail, not to remind you every
+        // few seconds that it's still stuck.
+        static std::string s_lastWarning;
+        static int         s_repeatCount     = 0;
+        constexpr int      s_reannounceEvery = 18000; // ~10 min of "No camera" at ~30fps
+        if( pMessage == s_lastWarning )
+        {
+            if( ++s_repeatCount % s_reannounceEvery == 0 )
+            {
+                Printf( RT_DiagPrintLevel(), "(still repeating -- %d time%s so far) %s\n",
+                       s_repeatCount, s_repeatCount == 1 ? "" : "s", pMessage );
+            }
+        }
+        else
+        {
+            if( s_repeatCount > 0 )
+            {
+                Printf( RT_DiagPrintLevel(), "(previous message repeated %d more time%s)\n",
+                       s_repeatCount, s_repeatCount == 1 ? "" : "s" );
+            }
+            s_lastWarning = pMessage;
+            s_repeatCount = 0;
+            Printf( RT_DiagPrintLevel(), "%s\n", pMessage );
+        }
     }
     else if( flags & RG_MESSAGE_SEVERITY_INFO )
     {
@@ -2194,6 +400,55 @@ void RT_Print( const char* pMessage, RgMessageSeverityFlags flags, void* pUserDa
 }
 
 } // anonymous namespace
+
+bool RT_ModMapNeedsLiveGeometryUpload()
+{
+    // Does this map have baked rt/scenes geometry to fall back on? If not, the
+    // world has to be uploaded live or it is not drawn AT ALL -- walls and flats
+    // are skipped as "static exportables" and the player is left looking at the
+    // sky dome with only sprites in it.
+    //
+    // THE UNDERSCORE TEST THIS REPLACES WAS A PROXY, AND IT WAS WRONG TWICE.
+    // It read "name contains '_' => PWAD => no scene", which covers Retribution
+    // (d64rtr_v15_map01) but silently assumes every plain `map01` HAS a scene.
+    // That assumption is a property of the install, not of the name: this tree
+    // ships Retribution's rt/scenes and keeps Doom II's in scenes_doom2_backup,
+    // so stock doom2.wad rendered as pure sky. It also fails the other way for
+    // any PWAD that DOES ship a scene, whose baked geometry would be ignored.
+    //
+    // Asking the filesystem answers both, and it is the same question RTGL1
+    // itself asks when it loads rt/scenes/<name>/<name>.gltf.
+    const char* mapname = RT_GetMapName();
+    if( mapname == nullptr || mapname[ 0 ] == '\0' )
+    {
+        return false;
+    }
+
+    // Cached because this is called per SEG, per frame -- tens of thousands of
+    // times a second -- and a stat() on each would be a hitch, not a cost.
+    // Keyed on the name so it re-resolves on level change and nothing else.
+    static std::string g_cached_mapname;
+    static bool        g_cached_needslive = false;
+
+    if( g_cached_mapname != mapname )
+    {
+        g_cached_mapname = mapname;
+
+        std::error_code ec;
+        const auto      scene = std::filesystem::path{ "rt" } / "scenes" / mapname /
+                           ( std::string{ mapname } + ".gltf" );
+
+        g_cached_needslive = !std::filesystem::exists( scene, ec );
+
+        Printf( RT_DiagPrintLevel(),
+                "RT geometry: %s -- %s\n",
+                mapname,
+                g_cached_needslive ? "no baked scene, uploading world live"
+                                   : "baked scene found, static geometry" );
+    }
+
+    return g_cached_needslive;
+}
 
 #ifdef _WIN32
 std::atomic< HWND > g_msgbox_parent{};
@@ -2208,6 +463,15 @@ std::atomic< HWND > g_msgbox_parent{};
 //
 //
 
+
+
+namespace
+{
+int    g_rt_precache_count   = 0;
+double g_rt_precache_ms      = 0.0;
+bool   g_rt_precache_pending = false;
+bool   g_rt_precache_capped  = false;
+} // namespace
 
 
 std::string RT_InitErrorMessage(RgResult r, bool isdebug, const char* remixdll)
@@ -2273,7 +537,14 @@ void RT_InitInstance(RgWin32SurfaceCreateInfo* win32Info, void* xlibDisplay, uns
             Args->CheckParm( "-rtdebug" )
                 ? RgMessageSeverityFlags{ RG_MESSAGE_SEVERITY_VERBOSE | RG_MESSAGE_SEVERITY_INFO |
                                           RG_MESSAGE_SEVERITY_WARNING | RG_MESSAGE_SEVERITY_ERROR }
-                : RgMessageSeverityFlags{ 0 },
+        // WARNING and ERROR are ALWAYS allowed; -rtdebug only adds the chatty
+        // VERBOSE/INFO stream. This used to be `0` without -rtdebug, i.e. RTGL
+        // failures were muted by default -- which is precisely how "DLSS-RR was
+        // compiled out of RTGL1.dll" survived undetected (every DLSSRR: failure
+        // string was suppressed), and how a null nvDlssRr still silently falls
+        // back to A-SVGF today. A renderer must never swallow its own errors.
+                : RgMessageSeverityFlags{ RG_MESSAGE_SEVERITY_WARNING |
+                                          RG_MESSAGE_SEVERITY_ERROR },
 
         .primaryRaysMaxAlbedoLayers = 1, .indirectIlluminationMaxAlbedoLayers = 1,
 
@@ -2321,6 +592,12 @@ void RT_InitInstance(RgWin32SurfaceCreateInfo* win32Info, void* xlibDisplay, uns
     }
     RgResult r = RT_DlopenAndCreateXlib( &info, xlibDisplay, xlibWindow, isdebug, &rt );
 #endif
+
+    // Doom64-RT: swap the two upload entry points for counting thunks BEFORE
+    // anything can call them. Done here rather than at each of the 36 call sites
+    // -- see rt_stats.h. A failed load leaves rt zeroed and the install is a
+    // no-op, so this is safe to run before the error check below.
+    RT_InstallStatThunks();
     if( r != RG_RESULT_SUCCESS )
     {
         auto msg = RT_InitErrorMessage(r, isdebug, remixdll);
@@ -2416,11 +693,13 @@ Win32RTVideo::Win32RTVideo()
             RT_FEATURE_FSR3_FG  = 2,
             RT_FEATURE_DLSS2    = 4,
             RT_FEATURE_DLSS3_FG = 8,
+            RT_FEATURE_DLSS_RR  = 16,
         };
 
         const std::pair< std::filesystem::path, int > dlls[] = {
             { "rt/bin/D3D12Core.dll", RT_FEATURE_FSR3_FG | RT_FEATURE_DLSS3_FG },
             { "rt/bin/nvngx_dlss.dll", RT_FEATURE_DLSS2 },
+            { "rt/bin/nvngx_dlssd.dll", RT_FEATURE_DLSS_RR },
             { "rt/bin/nvngx_dlssg.dll", RT_FEATURE_DLSS3_FG },
             { "rt/bin/NvLowLatencyVk.dll", RT_FEATURE_DLSS3_FG },
             { "rt/bin/sl.dlss.dll", RT_FEATURE_DLSS3_FG },
@@ -2462,6 +741,7 @@ Win32RTVideo::Win32RTVideo()
                 // clang-format off
                 if( failedFeatures & RT_FEATURE_DLSS3_FG) msg += "NVIDIA DLSS3 (AI Frame Generation)\n";
                 if( failedFeatures & RT_FEATURE_DLSS2   ) msg += "NVIDIA DLSS2 (AI Upscaling)\n";
+                if( failedFeatures & RT_FEATURE_DLSS_RR ) msg += "NVIDIA DLSS Ray Reconstruction\n";
                 if( failedFeatures & RT_FEATURE_FSR3_FG ) msg += "AMD FSR 3 (Frame Generation)\n";
                 if( failedFeatures & RT_FEATURE_FSR2    ) msg += "AMD FSR 2 (Upscaling)\n";
                 // clang-format on
@@ -2498,6 +778,96 @@ Win32RTVideo::Win32RTVideo()
 DFrameBuffer* Win32RTVideo::CreateFrameBuffer()
 {
     return new RTFrameBuffer{ m_hMonitor, vid_fullscreen };
+}
+
+TArray< uint8_t > rtx::RTFrameBuffer::GetScreenshotBuffer( int& pitch, ESSType& color_type, float& gamma )
+{
+    // RTGL1 exposes no GPU readback for the presented frame. Capture the HWND
+    // after present so `screenshot` / Level.MakeScreenShot work (and don't need focus).
+    const int w = GetClientWidth() > 0 ? GetClientWidth() : GetWidth();
+    const int h = GetClientHeight() > 0 ? GetClientHeight() : GetHeight();
+    if( w <= 0 || h <= 0 )
+    {
+        return {};
+    }
+
+    HWND hwnd = mainwindow.GetHandle();
+    if( !hwnd )
+    {
+        return {};
+    }
+
+    HDC hdcWin = GetDC( hwnd );
+    if( !hdcWin )
+    {
+        return {};
+    }
+
+    HDC     hdcMem = CreateCompatibleDC( hdcWin );
+    HBITMAP hbm    = CreateCompatibleBitmap( hdcWin, w, h );
+    HGDIOBJ old    = SelectObject( hdcMem, hbm );
+
+    // PW_RENDERFULLCONTENT: ask DWM for the redirected surface (Vulkan/DXGI).
+    BOOL ok = PrintWindow( hwnd, hdcMem, 0x00000002 );
+    if( !ok )
+    {
+        ok = BitBlt( hdcMem, 0, 0, w, h, hdcWin, 0, 0, SRCCOPY );
+    }
+
+    TArray< uint8_t > out;
+    if( ok )
+    {
+        BITMAPINFOHEADER bi{};
+        bi.biSize        = sizeof( bi );
+        bi.biWidth       = w;
+        bi.biHeight      = h; // bottom-up DIB
+        bi.biPlanes      = 1;
+        bi.biBitCount    = 32;
+        bi.biCompression = BI_RGB;
+
+        TArray< uint8_t > bgra( size_t( w ) * size_t( h ) * 4u, true );
+        if( GetDIBits( hdcMem,
+                       hbm,
+                       0,
+                       UINT( h ),
+                       bgra.Data(),
+                       reinterpret_cast< BITMAPINFO* >( &bi ),
+                       DIB_RGB_COLORS ) )
+        {
+            // Reject obviously empty / failed captures (all black).
+            uint64_t sum = 0;
+            for( int i = 0; i < w * h; ++i )
+            {
+                sum += bgra[ size_t( i ) * 4u + 0u ];
+                sum += bgra[ size_t( i ) * 4u + 1u ];
+                sum += bgra[ size_t( i ) * 4u + 2u ];
+            }
+            if( sum > 0 )
+            {
+                out.Resize( size_t( w ) * size_t( h ) * 3u );
+                for( int y = 0; y < h; ++y )
+                {
+                    const uint8_t* src = bgra.Data() + size_t( y ) * size_t( w ) * 4u;
+                    uint8_t*       dst = out.Data() + size_t( h - 1 - y ) * size_t( w ) * 3u;
+                    for( int x = 0; x < w; ++x )
+                    {
+                        dst[ x * 3 + 0 ] = src[ x * 4 + 2 ];
+                        dst[ x * 3 + 1 ] = src[ x * 4 + 1 ];
+                        dst[ x * 3 + 2 ] = src[ x * 4 + 0 ];
+                    }
+                }
+                pitch      = w * 3;
+                color_type = SS_RGB;
+                gamma      = 1.0f;
+            }
+        }
+    }
+
+    SelectObject( hdcMem, old );
+    DeleteObject( hbm );
+    DeleteDC( hdcMem );
+    ReleaseDC( hwnd, hdcWin );
+    return out;
 }
 
 void Win32RTVideo::Shutdown()
@@ -2606,9 +976,8 @@ auto RT_GetVramUsage( bool* ok ) -> const char*
     return buf;
 }
 
-namespace
-{
-
+// Outside the anonymous namespace below: rt_titles.cpp sizes its fullscreen
+// quads with it.
 RgExtent2D RT_GetCurrentWindowSize()
 {
     return {
@@ -2616,6 +985,9 @@ RgExtent2D RT_GetCurrentWindowSize()
         static_cast< uint32_t >( screen->GetHeight() ),
     };
 }
+
+namespace
+{
 
 void RT_ResolutionToRtgl( RgStartFrameRenderResolutionParams* dst, const RgExtent2D winsize )
 {
@@ -2711,6 +1083,12 @@ auto RT_GetSharpenTechniqueFromCvar( bool dlssOrFsr2 ) -> RgRenderSharpenTechniq
     }
 }
 
+// Snapshot of the last RT_UpscaleCvarsToRtgl() decision, for rt_rr_status.
+static bool g_rr_dbg_isremix     = false;
+static bool g_rr_dbg_wantNative  = false;
+static int  g_rr_dbg_nvDlss      = 0;
+static bool g_rr_dbg_rrRequested = false;
+
 void RT_UpscaleCvarsToRtgl( RgStartFrameRenderResolutionParams* pDst )
 {
     cvar::rt_available_dlss2 =
@@ -2742,6 +1120,38 @@ void RT_UpscaleCvarsToRtgl( RgStartFrameRenderResolutionParams* pDst )
     int amdFsr = cvar::rt_available_fsr2 || cvar::rt_available_fsr3fg //
                      ? int( cvar::rt_upscale_fsr2 )
                      : 0;
+
+    // Native Ray Reconstruction needs a DLSS quality mode; default to Balanced.
+    const bool wantNativeRr = !g_isremix && bool( cvar::rt_rayreconstr );
+    if( wantNativeRr && nvDlss == 0 && ( cvar::rt_available_dlss2 || cvar::rt_available_dlss3fg ) )
+    {
+        nvDlss                = 2;
+        cvar::rt_upscale_dlss = 2;
+    }
+
+    // DLSS and FSR2 both write pDst->upscaleTechnique and the FSR switch below
+    // runs *second*, so a non-zero rt_upscale_fsr2 silently overwrites the DLSS
+    // choice. rayReconstruction is still set afterwards (it only tests
+    // nvDlss != 0), so gzdoom would hand RTGL "upscaler=FSR2 + RR=on" -- a
+    // contradiction RTGL resolves by quietly dropping RR and running A-SVGF.
+    //
+    // rt_upscale_fsr2 is CVAR_ARCHIVE like every RT_CVAR, so a stale 2 in the
+    // ini disabled Ray Reconstruction across every launch while rt_rayreconstr
+    // still read 1 (2026-08-07). DLSS wins when both are set; RR depends on it.
+    if( nvDlss != 0 && amdFsr != 0 )
+    {
+        static bool s_warned = false;
+        if( !s_warned )
+        {
+            s_warned = true;
+            Printf( "RT: both rt_upscale_dlss (%d) and rt_upscale_fsr2 (%d) are set; "
+                    "they share one upscaler slot. Using DLSS and ignoring FSR2 "
+                    "(Ray Reconstruction requires DLSS). Set rt_upscale_fsr2 0 to silence.\n",
+                    nvDlss,
+                    amdFsr );
+        }
+        amdFsr = 0;
+    }
 
     switch( nvDlss )
     {
@@ -2835,7 +1245,84 @@ void RT_UpscaleCvarsToRtgl( RgStartFrameRenderResolutionParams* pDst )
         }
     }
 
+    // Native RR replaces A-SVGF + DLSS-SR; Frame Gen is out of scope for MVP.
+    // Gate on the technique that actually survived both switches above, not on
+    // nvDlss alone: RTGL drops rayReconstruction whenever the upscaler isn't
+    // DLSS (RenderResolutionHelper::Setup), so requesting RR alongside any
+    // other upscaler is a contradiction that silently costs the denoiser.
+    pDst->rayReconstruction = 0;
+    if( wantNativeRr && nvDlss != 0 &&
+        pDst->upscaleTechnique == RG_RENDER_UPSCALE_TECHNIQUE_NVIDIA_DLSS )
+    {
+        pDst->rayReconstruction = 1;
+        pDst->frameGeneration   = RG_FRAME_GENERATION_MODE_OFF;
+        if( int( cvar::rt_framegen ) != 0 )
+        {
+            cvar::rt_framegen = 0;
+        }
+    }
+
+    // Cached for the rt_rr_status CCMD (RTGL's own DLSSRR messages are muted
+    // unless -rtdebug, so this is the only in-game view of the decision chain).
+    g_rr_dbg_isremix     = g_isremix;
+    g_rr_dbg_wantNative  = wantNativeRr;
+    g_rr_dbg_nvDlss      = nvDlss;
+    g_rr_dbg_rrRequested = ( pDst->rayReconstruction != 0 );
+
+    // Report the decision the FIRST time it is actually computed, and on every
+    // later change. Running `rt_rr_status` from the command line reads the
+    // cached globals above before this function has ever run, so it reports
+    // startup defaults (DLSS2 available = NO) that look like a real negative --
+    // another way this decision chain lied. The failure reason from
+    // rgUtilIsUpscaleTechniqueAvailable is printed here because nothing else
+    // ever surfaced it at frame time.
+    {
+        static bool s_have = false;
+        static int  s_prev = -1;
+
+        const int state = ( int( bool( cvar::rt_available_dlss2 ) ) << 0 ) |
+                          ( int( bool( cvar::rt_available_dlss3fg ) ) << 1 ) |
+                          ( int( wantNativeRr ) << 2 ) |
+                          ( int( pDst->rayReconstruction != 0 ) << 3 ) | ( nvDlss << 4 );
+
+        if( !s_have || s_prev != state )
+        {
+            s_have = true;
+            s_prev = state;
+
+            Printf( RT_DiagPrintLevel(),
+                    "RT upscale/RR decision: DLSS2=%s DLSS3FG=%s nvDlss=%d "
+                    "wantNativeRr=%s -> rayReconstruction=%s\n",
+                    cvar::rt_available_dlss2 ? "yes" : "NO",
+                    cvar::rt_available_dlss3fg ? "yes" : "NO",
+                    nvDlss,
+                    wantNativeRr ? "yes" : "no",
+                    pDst->rayReconstruction ? "ON" : "OFF" );
+
+            if( !cvar::rt_available_dlss2 && cvar::rt_failreason_dlss2 )
+            {
+                Printf( RT_DiagPrintLevel(),
+                        "  DLSS2 unavailable, reason: %s\n",
+                        static_cast< const char* >( cvar::rt_failreason_dlss2 ) );
+            }
+        }
+    }
+
     pDst->sharpenTechnique = RT_GetSharpenTechniqueFromCvar( amdFsr || nvDlss );
+
+    // Doom64-RT: which DLSS render preset RTGL1 creates the feature with. It was
+    // hard-coded to E, and the DLSS runtime shipped in rt\bin is 310.7, on which
+    // E is a deprecated CNN preset. Passed through raw; RTGL1 clamps nothing,
+    // and NGX falls back to Default for any value it no longer recognises.
+    pDst->dlssPreset =
+        static_cast< uint32_t >( std::max< int >( 0, int{ cvar::rt_dlss_preset } ) );
+
+    // Doom64-RT: the Ray Reconstruction twin. Raw
+    // NVSDK_NGX_RayReconstruction_Hint_Render_Preset value; for RR only
+    // 0 (Default) / 4 (D) / 5 (E) mean anything -- NGX reverts everything else
+    // to Default. RTGL1 re-creates the RR feature when this changes.
+    pDst->dlssRrPreset =
+        static_cast< uint32_t >( std::max< int >( 0, int{ cvar::rt_rr_preset } ) );
 }
 
 template< typename T >
@@ -2851,11 +1338,11 @@ uint32_t safe_uint( T x )
 //
 //
 
-RTFrameBuffer::RTFrameBuffer( void* hMonitor, bool fullscreen )
+rtx::RTFrameBuffer::RTFrameBuffer( void* hMonitor, bool fullscreen )
     : SystemBaseFrameBuffer( hMonitor, fullscreen ), m_state{ new RTRenderState{ this } }
 {
 }
-RTFrameBuffer::~RTFrameBuffer()
+rtx::RTFrameBuffer::~RTFrameBuffer()
 {
     delete m_state;
     delete mVertexData;
@@ -2864,7 +1351,7 @@ RTFrameBuffer::~RTFrameBuffer()
     delete mLights;
     delete mBones;
 }
-void RTFrameBuffer::InitializeState()
+void rtx::RTFrameBuffer::InitializeState()
 {
     m_state      = new RTRenderState{ this };
     vendorstring = "RT";
@@ -2875,33 +1362,199 @@ void RTFrameBuffer::InitializeState()
     mBones       = new BoneBuffer( screen->mPipelineNbr );
 }
 
-void RTFrameBuffer::FirstEye()
+void rtx::RTFrameBuffer::FirstEye()
 {
     m_state->RT_AddMainCamera( r_viewpoint );
     Super::FirstEye();
 }
 
-FRenderState* RTFrameBuffer::RenderState()
+FRenderState* rtx::RTFrameBuffer::RenderState()
 {
     return m_state;
 }
-IVertexBuffer* RTFrameBuffer::CreateVertexBuffer()
+IVertexBuffer* rtx::RTFrameBuffer::CreateVertexBuffer()
 {
     return new RTVertexBuffer{};
 }
-IIndexBuffer* RTFrameBuffer::CreateIndexBuffer()
+IIndexBuffer* rtx::RTFrameBuffer::CreateIndexBuffer()
 {
     return new RTIndexBuffer{};
 }
-IDataBuffer* RTFrameBuffer::CreateDataBuffer( int bindingpoint, bool ssbo, bool needsresize )
+IDataBuffer* rtx::RTFrameBuffer::CreateDataBuffer( int bindingpoint, bool ssbo, bool needsresize )
 {
     return new RTDataBuffer{};
 }
-IHardwareTexture* RTFrameBuffer::CreateHardwareTexture( int numchannels )
+IHardwareTexture* rtx::RTFrameBuffer::CreateHardwareTexture( int numchannels )
 {
     return new RTHardwareTexture{};
 }
-void RTFrameBuffer::Draw2D()
+
+// Doom64-RT: THE RT PATH NEVER PRECACHED ANYTHING, and that was the stutter.
+//
+// p_setup.cpp's PrecacheLevel does all the work already -- it walks every actor
+// class the level spawns, marks every sprite frame and all 16 rotations, folds in
+// animations and switch pairs -- and hands each result to screen->PrecacheMaterial.
+// GL, GLES and Vulkan all override that. RTFrameBuffer overrode only
+// CreateHardwareTexture, so it inherited the empty base (v_video.h:226) and threw
+// the entire computed list away.
+//
+// The consequence was that EVERY texture in the game uploaded on the frame it was
+// first drawn, in the middle of play. Measured on 2026-08-20: an imp turning to
+// face the player cost 20-44 ms, a lost soul 60 ms, one sprite frame at a time,
+// scattered through the session -- because a sprite frame and rotation is its own
+// texture and is not touched until that exact pose is first visible.
+//
+// The same uploads at level load measured 0.2-0.6 ms each. It is not merely moving
+// the cost, it is removing about 100x of it; a mid-frame upload lands on a GPU that
+// is already busy, a load-time one does not.
+//
+// WHAT IS SAFE TO ASSUME HERE. CreateIfWasnt takes two arguments the precacher
+// cannot know, and neither is a problem:
+//   clampmode  -- unused. Both address modes are hardcoded to REPEAT and the
+//                 rtclamp_x/y helpers are commented out at the call (rt_buffers.h).
+//   renderStyle -- read only for STYLEF_RedIsAlpha. It IS baked in, because
+//                 CreateIfWasnt is idempotent. But the lazy path bakes it too, from
+//                 whichever draw happened to be first -- so this does not introduce
+//                 order-dependence, it removes it. STYLE_Normal is the answer for
+//                 every world surface and sprite; a Shaded-only texture would have
+//                 been a coin toss before and is now consistently normal.
+void rtx::RTFrameBuffer::PrecacheMaterial( FMaterial* mat, int translation )
+{
+    if( !cvar::rt_precache || mat == nullptr )
+    {
+        return;
+    }
+
+    // THE 4096 CEILING. RTGL1's texture array is TEXTURE_COUNT_MAX = 4096
+    // entries (Const.h:35) and a single material claims up to FIVE of them --
+    // albedo, ORM, normal, emissive, height. So the budget is not "how many
+    // textures", it is "how many slots", and the engine side cannot see the
+    // difference. Nothing frees them either: the destructor's
+    // rgMarkOriginalTextureAsDeleted is #if 0'd in rt_buffers.h, so the array
+    // only ever grows within a session.
+    //
+    // Precaching every actor class produced 2094 provides, blew past 4096
+    // slots, and RTGL1 dropped 487 textures with "Reached texture limit"
+    // (TextureManager.cpp:738) -- which is a Warning, not an error, so the game
+    // carried on and rendered the HUD and the status bar as white and pink
+    // blocks (screen/precacheIssue.png, 2026-08-21).
+    //
+    // 1600 is empirical, from the only two data points there are: 1526 provides
+    // precached cleanly, 2094 overflowed. It is deliberately nearer the known
+    // good one. This is a guard against corruption, NOT the fix -- the fix is a
+    // larger TEXTURE_COUNT_MAX, which lives in the RTGL1 repo.
+    if( g_rt_precache_count >= int{ cvar::rt_precache_budget } )
+    {
+        if( !g_rt_precache_capped )
+        {
+            g_rt_precache_capped = true;
+            Printf( RT_DiagPrintLevel(),
+                    "RT precache: stopped at the %d-texture budget (rt_precache_budget). "
+                    "Anything past this uploads on first draw, as before.\n",
+                    int{ cvar::rt_precache_budget } );
+        }
+        return;
+    }
+
+    FGameTexture* gametex = mat->Source();
+    if( gametex == nullptr || gametex->GetUseType() == ETextureType::SWCanvas )
+    {
+        return;
+    }
+
+    FTexture* base = gametex->GetTexture();
+    if( base == nullptr )
+    {
+        return;
+    }
+
+    auto* hwtex = static_cast< RTHardwareTexture* >(
+        base->GetHardwareTexture( translation, mat->GetScaleFlags() ) );
+    if( hwtex == nullptr )
+    {
+        return;
+    }
+
+    const uint64_t t0 = I_nsTime();
+
+    hwtex->CreateIfWasnt( *gametex,
+                          CLAMP_NONE,
+                          translation,
+                          mat->GetScaleFlags(),
+                          LegacyRenderStyles[ STYLE_Normal ] );
+
+    g_rt_precache_ms += double( I_nsTime() - t0 ) / 1e6;
+    g_rt_precache_count++;
+    g_rt_precache_pending = true;
+}
+
+// Reported from the first frame after the precache pass, because there is no hook
+// at the end of it. Without a number this change is unfalsifiable: "the stutter
+// went away" and "the precache silently did nothing" look identical in play.
+void rtx::RT_ReportPrecache()
+{
+    if( !g_rt_precache_pending )
+    {
+        return;
+    }
+    g_rt_precache_pending = false;
+
+    Printf( RT_DiagPrintLevel(),
+            "RT precache: %d texture(s) uploaded in %.1f ms at level load\n",
+            g_rt_precache_count,
+            g_rt_precache_ms );
+
+    g_rt_precache_count = 0;
+    g_rt_precache_ms    = 0.0;
+}
+
+// Doom64-RT: one line per level naming the LIQUID state the shader is actually
+// getting. It exists because the failure it diagnoses is silent from both ends.
+//
+// The animated water wave is GLOBAL -- getNormal() swaps it in for any
+// water-flagged primitive -- and the only thing that takes it back off a blood
+// or sludge bed is the per-liquid relief mix. So "the ripple is back on the
+// blood" has three causes that look identical in play and identical in the map:
+// the relief cvar is 0, the engine is older than the cvar (the launcher's pin
+// is then an orphan -- one "Unknown command" buried in the boot spam, and the
+// uniform reads whatever RTGL left there), or the authored _n never shipped.
+//
+// The release launcher already passes +logfile, so this line is in every
+// player's rt-console.log and a bug report answers the question by itself.
+// It reads the same cvars RT_DrawFrame uploads, so it cannot drift from them.
+void rtx::RT_ReportLiquidConfig()
+{
+    static FString s_reported;
+
+    const char* mapname = RT_GetMapName();
+    if( !mapname || s_reported.Compare( mapname ) == 0 )
+    {
+        return;
+    }
+    s_reported = mapname;
+
+    // Same order the uniform is packed in: water / nukage / sludge / blood.
+    // Water and nukage are literals there, not cvars, and are printed as such.
+    Printf( RT_DiagPrintLevel(),
+            "RT liquid: style=%d liquids=%d split=%d wave=%.2f@%.2f | "
+            "relief w/n/s/b %.2f/%.2f/%.2f/%.2f  refl %.2f/%.2f/%.2f/%.2f  "
+            "flow(blood) %.2f\n",
+            bool{ cvar::rt_water_style } ? 1 : 0,
+            bool{ cvar::rt_water_liquids } ? 1 : 0,
+            bool{ cvar::rt_liquid_checkerboard } ? 1 : 0,
+            float{ cvar::rt_water_wavestren },
+            float{ cvar::rt_water_wavespeed },
+            0.f,
+            0.f,
+            float{ cvar::rt_sludge_relief },
+            float{ cvar::rt_blood_relief },
+            1.f,
+            float{ cvar::rt_nukage_refl },
+            float{ cvar::rt_sludge_refl },
+            float{ cvar::rt_blood_refl },
+            float{ cvar::rt_blood_flow } );
+}
+void rtx::RTFrameBuffer::Draw2D()
 {
     ::Draw2D( twod, *m_state );
 }
@@ -2944,70 +1597,8 @@ auto RT_DamageIntensity() -> std::optional< float >
     }
     return {};
 }
-
-uint32_t RT_CalcPowerupFlags()
-{
-    auto player = RT_GetPlayer();
-    if( !player )
-    {
-        return 0;
-    }
-
-    uint32_t powerups = 0;
-
-    for( AActor* in = player->mo->Inventory; in; in = in->Inventory )
-    {
-        if( in->IsKindOf( NAME_PowerStrength ) )
-        {
-            if( rtstate.m_berserkBlend > 10 )
-            {
-                powerups |= RT_POWERUP_FLAG_BERSERK_BIT;
-            }
-        }
-        else if( in->IsKindOf( NAME_PowerIronFeet ) )
-        {
-            powerups |= RT_POWERUP_FLAG_RADIATIONSUIT_BIT;
-        }
-        else if( in->IsKindOf( NAME_PowerInvulnerable ) )
-        {
-            powerups |= RT_POWERUP_FLAG_INVUNERABILITY_BIT;
-        }
-        else if( in->IsKindOf( NAME_PowerLightAmp ) )
-        {
-            switch( *cvar::rt_pw_lightamp )
-            {
-                case 1: powerups |= RT_POWERUP_FLAG_THERMALVISION_BIT; break;
-                case 2: powerups |= RT_POWERUP_FLAG_FLASHLIGHT_BIT; break;
-                default: powerups |= RT_POWERUP_FLAG_NIGHTVISION_BIT; break;
-            }
-        }
-        else if( in->IsKindOf( NAME_PowerInvisibility ) )
-        {
-            powerups |= RT_POWERUP_FLAG_INVISIBILITY_BIT;
-        }
-
-        // NAME_PowerTargeter
-        // NAME_PowerWeaponLevel2
-        // NAME_PowerFlight
-        // NAME_PowerSpeed
-        // NAME_PowerTorch
-        // NAME_PowerHighJump
-        // NAME_PowerReflection
-        // NAME_PowerDrain
-        // NAME_PowerScanner
-        // NAME_PowerDoubleFiringSpeed
-        // NAME_PowerInfiniteAmmo
-        // NAME_PowerBuddha
-    }
-
-    if( player->bonuscount > 0 )
-    {
-        powerups |= RT_POWERUP_FLAG_BONUS_BIT;
-    }
-
-    return powerups;
-}
 } // anonymous namespace
+
 
 //
 //
@@ -3022,14 +1613,247 @@ bool          g_noinput_onstart  = true;
 bool   g_cpu_latency_get = false;
 double g_cpu_latency     = 0;
 
-static void RT_DrawTitle();
-static void RT_ClearTitles();
-static void RT_InjectTitleIntoDoomMap( const char* mapname );
+// RT_DrawTitle / RT_ClearTitles / RT_InjectTitleIntoDoomMap now live in
+// rt_titles.cpp and are declared in rt_internal.h.
 
-void RT_OnLevelLoad( const char* mapname)
+
+// Walk to the lava, without walking to the lava.
+//
+// Every "the lava lights nothing" report so far was judged from wherever the
+// player happened to be standing, and the debug line eventually showed the
+// camera 1530 map units -- 48 metres -- from the nearest lava light. At that
+// range 60 lumen delivers an irradiance of about 0.03, so "no difference" was
+// the correct observation and said nothing at all about the feature.
+//
+// This puts the player on the lava so the comparison is actually the one being
+// argued about. Prints the sectors it found either way, so "there is no lava
+// here" is distinguishable from "the lava is not lit".
+CCMD( rt_lava_goto )
 {
+    if( !primaryLevel )
+    {
+        Printf( "rt_lava_goto: no level\n" );
+        return;
+    }
+
+    AActor* pmo = players[ consoleplayer ].mo;
+    if( !pmo )
+    {
+        Printf( "rt_lava_goto: no player\n" );
+        return;
+    }
+
+    int found = 0;
+    for( unsigned i = 0; i < primaryLevel->sectors.Size(); i++ )
+    {
+        const sector_t& sec = primaryLevel->sectors[ i ];
+        auto* gtex = TexMan.GetGameTexture( sec.GetTexture( sector_t::floor ), true );
+        if( !gtex || !RT_IsLavaFlat( gtex->GetName().GetChars() ) )
+        {
+            continue;
+        }
+        found++;
+
+        const DVector2 c{ double( sec.centerspot.X ), double( sec.centerspot.Y ) };
+        // centerspot is the bounding-box centre and a concave sector's can lie
+        // outside it, so only move if it really is in this sector.
+        const bool inside = ( primaryLevel->PointInSector( c.X, c.Y ) == &sec );
+        const double z = sec.floorplane.ZatPoint( c );
+
+        Printf( "rt_lava_goto: sector %u floor \"%s\" at (%.0f %.0f %.0f)%s\n",
+                i,
+                gtex->GetName().GetChars(),
+                c.X,
+                c.Y,
+                z,
+                inside ? "" : "  [centre is outside the sector, not moving there]" );
+
+        if( found == 1 && inside )
+        {
+            pmo->SetOrigin( DVector3{ c.X, c.Y, z + 8.0 }, false );
+            Printf( "rt_lava_goto: moved you there. rt_lava_light_debug 1 prints "
+                    "the distance to the nearest lava light.\n" );
+        }
+    }
+
+    if( found == 0 )
+    {
+        Printf( "rt_lava_goto: no lava floor in this map. MAP15/20/21/34 have one.\n" );
+    }
+}
+
+// Walk to the blood, without walking to the blood.
+//
+// The same instrument as rt_lava_goto, for the same reason and after the same
+// mistake: a blood pool is a puddle in a corner of a map, and every judgement
+// of "is the relief showing / is the pulse moving" is worthless from wherever
+// the player happened to spawn. MAP08's nine pools sit at z -256 in pits, where
+// "it does not work" and "it works and you cannot see it" are the same picture
+// -- which is exactly what cost the poison bubbles a round.
+//
+// Prints every pool it found either way, so "there is no blood here" stays
+// distinguishable from "the blood is not doing anything".
+// Doom64-RT: put the player on a liquid pool.
+//
+// A pool is a puddle in a corner, and every verdict judged from the spawn point
+// is worthless -- MAP08's nine blood pools sit at z -256 in PITS, where "broken"
+// and "working, 256 units below you" are the same screenshot. Shared by
+// rt_blood_goto and rt_sludge_goto; the only thing that differs is the pair of
+// floor-texture prefixes and what to print.
+static void l_liquidGoto( const char* cmd,
+                          const char* prefix1,
+                          const char* prefix2,
+                          const char* hint,
+                          const char* whereToLook )
+{
+    if( !primaryLevel )
+    {
+        Printf( "%s: no level\n", cmd );
+        return;
+    }
+
+    AActor* pmo = players[ consoleplayer ].mo;
+    if( !pmo )
+    {
+        Printf( "%s: no player\n", cmd );
+        return;
+    }
+
+    int  found = 0;
+    // The FIRST POOL WE CAN ACTUALLY STAND IN, not "the first pool, if we can".
+    // rt_lava_goto keys its move off `found == 1`, so a concave first sector --
+    // whose bounding-box centre falls outside itself -- makes it print its
+    // findings and move nobody. On MAP17 the first blood sector is exactly that,
+    // so the lava version's shape would have left the player at the spawn point
+    // and reported success.
+    bool moved = false;
+    for( unsigned i = 0; i < primaryLevel->sectors.Size(); i++ )
+    {
+        const sector_t& sec  = primaryLevel->sectors[ i ];
+        auto*           gtex = TexMan.GetGameTexture( sec.GetTexture( sector_t::floor ), true );
+        if( !gtex )
+        {
+            continue;
+        }
+        // PREFIX, not an exact name: D64B2_01 is frame 1 of a 64-frame ANIMDEFS
+        // sequence and GetTexture() returns whichever frame is showing this tic,
+        // so an exact match succeeds on one tic in 64. Same trap as the poison
+        // bubbles' sector scan.
+        const char* fl = gtex->GetName().GetChars();
+        if( strncmp( fl, prefix1, 6 ) != 0 && strncmp( fl, prefix2, 6 ) != 0 )
+        {
+            continue;
+        }
+        found++;
+
+        const DVector2 c{ double( sec.centerspot.X ), double( sec.centerspot.Y ) };
+        // centerspot is the bounding-box centre and a concave sector's can lie
+        // outside it, so only move if it really is in this sector.
+        const bool   inside = ( primaryLevel->PointInSector( c.X, c.Y ) == &sec );
+        const double z      = sec.floorplane.ZatPoint( c );
+
+        Printf( "%s: sector %u floor \"%s\" at (%.0f %.0f %.0f)%s\n",
+                cmd,
+                i,
+                fl,
+                c.X,
+                c.Y,
+                z,
+                inside ? "" : "  [centre is outside the sector, not moving there]" );
+
+        if( !moved && inside )
+        {
+            moved = true;
+            pmo->SetOrigin( DVector3{ c.X, c.Y, z + 8.0 }, false );
+            Printf( "%s: moved you there. %s\n", cmd, hint );
+        }
+    }
+
+    if( found == 0 )
+    {
+        Printf( "%s: no matching liquid floor in this map. %s\n", cmd, whereToLook );
+    }
+    else if( !moved )
+    {
+        Printf( "%s: found %d pool(s) but every centre lies outside its "
+                "own sector, so you were not moved.\n",
+                cmd,
+                found );
+    }
+}
+
+CCMD( rt_blood_goto )
+{
+    l_liquidGoto( "rt_blood_goto",
+                  "D64B1_",
+                  "D64B2_",
+                  "rt_blood_relief 0/1 flips the relief, rt_blood_refl 0/1 flips "
+                  "the water reflection, rt_blood_flow_debug 1 paints the flow phase.",
+                  "MAP17 (39 pools), MAP32 (12) and MAP08 (9, in pits) have one." );
+}
+
+CCMD( rt_sludge_goto )
+{
+    l_liquidGoto( "rt_sludge_goto",
+                  "D64S1_",
+                  "D64S2_",
+                  "rt_sludge_relief 0/1 flips the mud relief, rt_sludge_refl 0/1 "
+                  "flips the water reflection.",
+                  "only MAP12 (6 sectors) and MAP34 (the fluid sampler) have sludge floors." );
+}
+
+CCMD( rt_sky_here )
+{
+    if( !bool{ cvar::rt_sky_log } )
+    {
+        Printf( "rt_sky_here: set rt_sky_log 1 first, then walk into the room.\n" );
+        return;
+    }
+    if( !primaryLevel )
+    {
+        Printf( "rt_sky_here: no level\n" );
+        return;
+    }
+    Printf( "rt_sky_here: %zu sky primitives submitted last frame\n",
+            g_skyprims_prev.size() );
+    int shown = 0;
+    for( const auto& n : g_skyprims_prev )
+    {
+        const float w = n.max[ 0 ] - n.min[ 0 ];
+        const float h = n.max[ 1 ] - n.min[ 1 ];
+        const float d = n.max[ 2 ] - n.min[ 2 ];
+        // A sky WALL is thin in one horizontal axis and tall; a sky FLAT is thin
+        // vertically. Naming which is which is most of the answer.
+        const char* kind = ( h < 1.0f ) ? "FLAT (ceiling opening)" : "WALL (band/slot)";
+        Printf( "  %-22s  size %7.1f x %7.1f x %7.1f  at (%.0f, %.0f, %.0f)\n",
+                kind, w, h, d,
+                ( n.min[ 0 ] + n.max[ 0 ] ) * 0.5f,
+                ( n.min[ 1 ] + n.max[ 1 ] ) * 0.5f,
+                ( n.min[ 2 ] + n.max[ 2 ] ) * 0.5f );
+        if( ++shown >= 40 )
+        {
+            Printf( "  ... (%zu more)\n", g_skyprims_prev.size() - shown );
+            break;
+        }
+    }
+}
+
+// The per-map presets (moon, clouds, tint, fog) moved to rt_presets.cpp and the
+// storm to rt_weather.cpp. Both are declared in rt_internal.h.
+
+void RT_OnLevelLoad( const char* mapname )
+{
+    RT_OnLevelLoadPresets( mapname );
+    // AFTER the preset tables, never before. RT_CloudApplyPresets writes
+    // rt_clouds unconditionally when rt_clouds_presets is on, so a fire sky
+    // that set up its deck first would have it overwritten and would look like
+    // the cvar does nothing.
+    RT_FireSkyOnLevelLoad( mapname );
+
     g_resetposteffects = true;
     g_resetfluid       = true;
+    g_rt_lightcut      = true; // DLSS-RR: new scene, flush temporal history unconditionally
+    g_rt_lightcut_why  = "levelload";
     RT_ClearTitles();
     RT_InjectTitleIntoDoomMap( mapname );
     RT_ForceIntroCutsceneMusicStop();
@@ -3102,6 +1926,236 @@ namespace classic_toggle
     float                  g_source = 0.0f;
     std::optional< float > g_target = {};
 
+    // Why is DLSS Ray Reconstruction on/off? RTGL's own DLSSRR messages are
+    // suppressed unless gzdoom is launched with -rtdebug, so this prints the
+    // whole gzdoom-side decision chain that feeds
+    // RgStartFrameRenderResolutionParams::rayReconstruction.
+    CCMD( rt_rr_status )
+    {
+        Printf( "--- DLSS Ray Reconstruction status ---\n" );
+        Printf( "  rt_rayreconstr        = %d  (user request)\n", int( bool( cvar::rt_rayreconstr ) ) );
+        Printf( "  rt_upscale_dlss       = %d  (0 = off; RR needs != 0)\n", int( cvar::rt_upscale_dlss ) );
+        Printf( "  remix mode            = %s  (RR is native-only, disabled under Remix)\n",
+                g_rr_dbg_isremix ? "YES" : "no" );
+        Printf( "  DLSS2 available       = %s%s%s\n",
+                cvar::rt_available_dlss2 ? "YES" : "NO",
+                ( !cvar::rt_available_dlss2 && cvar::rt_failreason_dlss2 ) ? "  reason: " : "",
+                ( !cvar::rt_available_dlss2 && cvar::rt_failreason_dlss2 ) ? cvar::rt_failreason_dlss2
+                                                                          : "" );
+        Printf( "  DLSS3-FG available    = %s%s%s\n",
+                cvar::rt_available_dlss3fg ? "YES" : "NO",
+                ( !cvar::rt_available_dlss3fg && cvar::rt_failreason_dlss3fg ) ? "  reason: " : "",
+                ( !cvar::rt_available_dlss3fg && cvar::rt_failreason_dlss3fg )
+                    ? cvar::rt_failreason_dlss3fg
+                    : "" );
+        Printf( "  -> wantNativeRr       = %s\n", g_rr_dbg_wantNative ? "YES" : "no" );
+        Printf( "  -> nvDlss (mode)      = %d\n", g_rr_dbg_nvDlss );
+        Printf( "  -> RR REQUESTED       = %s\n", g_rr_dbg_rrRequested ? "YES" : "NO" );
+        Printf( "\n" );
+        // Everything above is what gzdoom ASKS FOR. RTGL's Dev UI can silently
+        // replace it afterwards, so none of it proves what actually ran.
+        Printf( "  NOTE: this is gzdoom's REQUEST, not the applied state. RTGL's Dev UI\n"
+                "  can override it -- a sticky \"DLSS Ray Reconstruction\" checkbox wins\n"
+                "  even with the Override master switch OFF, and used to persist across\n"
+                "  launches in rt/devmode_settings.json. That made this command report\n"
+                "  \"RR REQUESTED = YES\" through several sessions that actually ran A-SVGF\n"
+                "  (2026-08-07). RTGL now resets sticky flags on load and warns (-rtdebug)\n"
+                "  whenever it overrides this request. To be certain: launch with -rtdebug\n"
+                "  and check for a \"Dev override: DLSS Ray Reconstruction forced ...\" line,\n"
+                "  or delete rt/devmode_settings.json.\n" );
+        Printf( "\n" );
+        if( !g_rr_dbg_rrRequested )
+        {
+            Printf( "  RR is NOT requested -> A-SVGF denoiser runs (image should be smooth).\n" );
+        }
+        else
+        {
+            Printf( "  RR IS requested. If the image is still raw/noisy, RTGL accepted the\n"
+                    "  request but DLSSRR::Apply() bailed (VulkanDevice.cpp skips A-SVGF\n"
+                    "  whenever the nvDlssRr object merely exists) -> no denoiser at all.\n"
+                    "  Relaunch with -rtdebug to see the DLSSRR: lines from RTGL.\n" );
+        }
+    }
+
+    // `moon`, `clouds`, `fog`, `smoke` and `thunder` used to be declared here,
+    // inside namespace classic_toggle, which has nothing to do with any of them.
+    // Each now sits in the file that owns the state it reports: rt_presets.cpp,
+    // rt_smoke.cpp, rt_weather.cpp.
+
+
+    // `whatsthat` -- name the surface under the crosshair.
+    //
+    // Every wrong guess in this work has been the same mistake: identifying a reported
+    // surface from a screenshot by rendering candidate textures and picking the one
+    // that looks right. That got C921 right and C53 wrong, HDOR10 right and C52 wrong,
+    // and each miss cost a round trip. A screenshot does not carry a sector index; the
+    // running game does.
+    //
+    // Point at the thing, type `whatsthat`, and it reports the sector, its lightlevel,
+    // its tag, the texture on the exact surface hit, and whether that sector is above
+    // this map's rt_sector_emis threshold -- i.e. whether it is self-emitting, which is
+    // the whole question.
+    CCMD( whatsthat )
+    {
+        if( !primaryLevel || !players[ consoleplayer ].mo )
+        {
+            Printf( "whatsthat: no level\n" );
+            return;
+        }
+        AActor* pmo = players[ consoleplayer ].mo;
+
+        FLineTraceData d{};
+        const bool hit = P_LineTrace( pmo,
+                                      pmo->Angles.Yaw,
+                                      8192.,
+                                      pmo->Angles.Pitch,
+                                      0,
+                                      pmo->Height * 0.5,
+                                      0.,
+                                      0.,
+                                      &d );
+        if( !hit || !d.HitSector )
+        {
+            Printf( "whatsthat: nothing hit within 8192 units\n" );
+            return;
+        }
+
+        const int   idx  = d.HitSector->Index();
+        const int   ll   = d.HitSector->lightlevel;
+        const char* tex  = "?";
+        if( d.HitTexture.isValid() )
+        {
+            if( auto* gt = TexMan.GetGameTexture( d.HitTexture, true ) )
+            {
+                tex = gt->GetName().GetChars();
+            }
+        }
+        static const char* partname[] = { "top", "middle", "bottom" };
+        const char* what =
+            d.HitType == TRACE_HitFloor    ? "floor"
+            : d.HitType == TRACE_HitCeiling ? "ceiling"
+            : d.HitType == TRACE_HitWall
+                ? ( d.LinePart >= 0 && d.LinePart <= 2 ? partname[ d.LinePart ] : "wall" )
+                : "actor";
+
+        Printf( "whatsthat: sector %d  lightlevel %d  tag %d  %s texture '%s'\n",
+                idx,
+                ll,
+                primaryLevel->GetFirstSectorTag( d.HitSector ),
+                what,
+                tex );
+        Printf( "           threshold %.0f -> %s\n",
+                g_sectorEmisThreshold,
+                float( ll ) > g_sectorEmisThreshold ? "ABOVE: this surface SELF-EMITS"
+                                                    : "below: not self-emitting" );
+        {
+            // rt_sector_emis_saturation's gate, computed the SAME way l_worldemissive()
+            // computes it (rt_draw.cpp) -- off sector_t::Colormap.LightColor directly,
+            // since that field is what push_sectorlight() feeds in during the real draw
+            // (see hw_flats.cpp/hw_walls.cpp: Colormap = frontsector->Colormap in the
+            // common case). Answers the question the lightlevel line above cannot:
+            // whether the colour gate is what is actually keeping this surface dark or
+            // lit, not just whether it crossed the lightlevel threshold.
+            const PalEntry lc    = d.HitSector->Colormap.LightColor;
+            const float    r     = lc.r / 255.f;
+            const float    g     = lc.g / 255.f;
+            const float    b     = lc.b / 255.f;
+            const float    maxc  = std::max( { r, g, b } );
+            const float    minc  = std::min( { r, g, b } );
+            const float    satur = maxc > 1.e-4f ? ( maxc - minc ) / maxc : 0.f;
+            const float    gate  = float{ cvar::rt_sector_emis_saturation };
+            Printf( "           colormap tint %d,%d,%d  saturation %.3f  (rt_sector_emis_saturation "
+                    "%.2f -> %s)\n",
+                    lc.r, lc.g, lc.b, satur, gate,
+                    satur >= gate ? "PASSES the colour gate" : "GATED OUT by colour" );
+        }
+        {
+            // The frame test, printed: what does this element sit inside?
+            int hi = -1, hiIdx = -1;
+            for( auto ln : d.HitSector->Lines )
+            {
+                sector_t* o = ( ln->frontsector == d.HitSector ) ? ln->backsector
+                                                                 : ln->frontsector;
+                if( o && o != d.HitSector && o->lightlevel > hi )
+                {
+                    hi    = o->lightlevel;
+                    hiIdx = o->Index();
+                }
+            }
+            if( hiIdx >= 0 )
+            {
+                Printf( "           brightest neighbour: sector %d at %d  (delta %+d)\n",
+                        hiIdx, hi, ll - hi );
+            }
+        }
+    }
+
+    // `rt_dump_lightthinkers` -- who is animating a sector's lightlevel.
+    //
+    // rt_lightlevel_watch says WHICH sectors move; this says WHAT is moving them, which
+    // is the question the map data could not answer on MAP13: seven sectors on tag 29
+    // sweep 221..255 forever while the map has no sector special, no linedef Light_*,
+    // and no ACS call on that tag anywhere -- not in its own BEHAVIOR and not in the
+    // twelve LOADACS libraries.
+    //
+    // A running thinker is the ground truth regardless of how it got created, so this
+    // asks the playsim rather than the file. GZDoom builds one DLighting subclass per
+    // animated sector (DGlow, DFlicker, DFireFlicker, DLightFlash, DStrobe, DPhased),
+    // and the class name identifies the effect immediately.
+    CCMD( rt_dump_lightthinkers )
+    {
+        if( !primaryLevel )
+        {
+            Printf( "rt_dump_lightthinkers: no level\n" );
+            return;
+        }
+        auto it = TThinkerIterator< DLighting >( primaryLevel, STAT_LIGHT );
+        int  n  = 0;
+        while( DLighting* l = it.Next() )
+        {
+            sector_t* s = l->GetSector();
+            const int idx = s ? s->Index() : -1;
+            Printf( "  %-16s sector %-4d lightlevel=%d tag=%d\n",
+                    l->GetClass()->TypeName.GetChars(),
+                    idx,
+                    s ? s->lightlevel : -1,
+                    ( s && idx >= 0 ) ? primaryLevel->GetFirstSectorTag( s ) : -1 );
+            n++;
+        }
+        Printf( "rt_dump_lightthinkers: %d light thinker(s) running\n", n );
+    }
+
+
+    CCMD( rt_dump_dynlights )
+    {
+        if( !primaryLevel || !primaryLevel->lights )
+        {
+            Printf( "rt_dump_dynlights: no level / no light list\n" );
+            return;
+        }
+        unsigned n = 0;
+        for( FDynamicLight* light = primaryLevel->lights; light != nullptr; light = light->next )
+        {
+            if( !light->IsActive() || light->X() < -1.0e6 )
+            {
+                continue;
+            }
+            Printf(
+                "  [%u] pos=(%.0f,%.0f,%.0f) rgb=(%d,%d,%d) radius=%.1f active=%d\n",
+                n,
+                light->X(),
+                light->Y(),
+                light->Z(),
+                light->GetRed(),
+                light->GetGreen(),
+                light->GetBlue(),
+                light->m_currentRadius,
+                light->IsActive() ? 1 : 0 );
+            ++n;
+        }
+        Printf( "rt_dump_dynlights: %u listed (GZDoom FDynamicLight chain)\n", n );
+    }
+
     CCMD( rt_classic_toggle )
     {
         if( g_isremix )
@@ -3149,105 +2203,86 @@ namespace classic_toggle
     }
 } // namespace classic_toggle
 
-auto g_sectorlightlevels = std::vector< uint8_t >{};
+} // anonymous namespace
 
-void RT_MakeLightstyles()
+// Out of the anonymous namespace: rt_weapon.cpp's RT_AddFlashlight reads the
+// flashlight bit off it.
+uint32_t RT_CalcPowerupFlags()
 {
-    if( !primaryLevel || primaryLevel->sectors.Size() == 0 )
+    auto player = RT_GetPlayer();
+    if( !player )
     {
-        g_sectorlightlevels.clear();
-        return;
+        return 0;
     }
-    g_sectorlightlevels.resize( primaryLevel->sectors.Size() );
 
-    for( uint32_t i = 0; i < primaryLevel->sectors.Size(); i++ )
+    uint32_t powerups = 0;
+
+    for( AActor* in = player->mo->Inventory; in; in = in->Inventory )
     {
-        g_sectorlightlevels[ i ] = uint8_t( std::clamp( //
-            primaryLevel->sectors[ i ].GetLightLevel(),
-            0,
-            255 ) );
-    }
-}
-
-void RT_UploadExportableSectorLights()
-{
-    assert( g_sectorlightlevels.size() == primaryLevel->sectors.Size() );
-
-    for( uint32_t i = 0; i < primaryLevel->sectors.Size(); i++ )
-    {
-        const sector_t& sector = primaryLevel->sectors[ i ];
-
-        float z;
+        if( in->IsKindOf( NAME_PowerStrength ) )
         {
-            auto zfloor   = float( sector.floorplane.ZatPoint( sector.centerspot ) );
-            auto zceiling = float( sector.ceilingplane.ZatPoint( sector.centerspot ) );
-
-            // if too thin
-            if( std::abs( zfloor - zceiling ) < 0.1f )
+            if( rtstate.m_berserkBlend > 10 )
             {
-                bool important = ( sector.special == Light_Phased ) ||
-                                 ( sector.special == LightSequenceStart ) ||
-                                 ( sector.special == LightSequenceSpecial1 ) ||
-                                 ( sector.special == LightSequenceSpecial2 ) ||
-                                 ( sector.special == dLight_Flicker ) ||
-                                 ( sector.special == dLight_StrobeFast ) ||
-                                 ( sector.special == dLight_StrobeSlow ) ||
-                                 ( sector.special == dLight_Strobe_Hurt ) ||
-                                 ( sector.special == dLight_Glow ) ||
-                                 ( sector.special == dLight_StrobeSlowSync ) ||
-                                 ( sector.special == dLight_StrobeFastSync ) ||
-                                 ( sector.special == dLight_FireFlicker ) ||
-                                 ( sector.special == sLight_Strobe_Hurt ) ||
-                                 ( sector.special == Light_OutdoorLightning ) ||
-                                 ( sector.special == Light_IndoorLightning1 ) ||
-                                 ( sector.special == Light_IndoorLightning2 );
-                if( !important )
-                {
-                    continue;
-                }
+                powerups |= RT_POWERUP_FLAG_BERSERK_BIT;
             }
-
-            z = ( zfloor + zceiling ) / 2;
+        }
+        else if( in->IsKindOf( NAME_PowerIronFeet ) )
+        {
+            powerups |= RT_POWERUP_FLAG_RADIATIONSUIT_BIT;
+        }
+        else if( in->IsKindOf( NAME_PowerInvulnerable ) )
+        {
+            powerups |= RT_POWERUP_FLAG_INVUNERABILITY_BIT;
+        }
+        else if( in->IsKindOf( NAME_PowerLightAmp ) )
+        {
+            switch( *cvar::rt_pw_lightamp )
+            {
+                case 1: powerups |= RT_POWERUP_FLAG_THERMALVISION_BIT; break;
+                case 2: powerups |= RT_POWERUP_FLAG_FLASHLIGHT_BIT; break;
+                default: powerups |= RT_POWERUP_FLAG_NIGHTVISION_BIT; break;
+            }
+        }
+        else if( in->IsKindOf( NAME_PowerInvisibility ) )
+        {
+            powerups |= RT_POWERUP_FLAG_INVISIBILITY_BIT;
         }
 
-        const auto center = FVector3{
-            float( sector.centerspot.X ),
-            float( sector.centerspot.Y ),
-            z,
-        };
-
-        auto adt = RgLightAdditionalEXT{
-            .sType      = RG_STRUCTURE_TYPE_LIGHT_ADDITIONAL_EXT,
-            .pNext      = nullptr,
-            .flags      = RG_LIGHT_ADDITIONAL_LIGHTSTYLE,
-            .lightstyle = int( i ), // references g_sectorlightlevels
-            .hashName   = "",
-        };
-
-        auto lsph = RgLightSphericalEXT{
-            .sType     = RG_STRUCTURE_TYPE_LIGHT_SPHERICAL_EXT,
-            .pNext     = &adt,
-            .color     = RG_PACKED_COLOR_WHITE,
-            .intensity = cvar::rt_autoexport_light,
-            .position  = { center.X * ONEGAMEUNIT_IN_METERS,
-                           center.Y * ONEGAMEUNIT_IN_METERS,
-                           center.Z * ONEGAMEUNIT_IN_METERS },
-            .radius    = 0.05f,
-        };
-
-        auto linfo = RgLightInfo{
-            .sType        = RG_STRUCTURE_TYPE_LIGHT_INFO,
-            .pNext        = &lsph,
-            .uniqueID     = SectorLightId_Base + i,
-            .isExportable = true, // so we can write in the gltf
-        };
-
-        RgResult r = rt.rgUploadLight( &linfo );
-        RG_CHECK( r );
+        // NAME_PowerTargeter
+        // NAME_PowerWeaponLevel2
+        // NAME_PowerFlight
+        // NAME_PowerSpeed
+        // NAME_PowerTorch
+        // NAME_PowerHighJump
+        // NAME_PowerReflection
+        // NAME_PowerDrain
+        // NAME_PowerScanner
+        // NAME_PowerDoubleFiringSpeed
+        // NAME_PowerInfiniteAmmo
+        // NAME_PowerBuddha
     }
+
+    if( player->bonuscount > 0 )
+    {
+        powerups |= RT_POWERUP_FLAG_BONUS_BIT;
+    }
+
+    return powerups;
 }
 
-}
+
+// The light uploaders and the smoke simulation used to live here -- 4,200 lines
+// of it, between classic_toggle and the frame loop. They are now:
+//
+//   rt_lights_sector.cpp    sector lights, gzdoom dynlights, lightlevel watch
+//   rt_lights_fixtures.cpp  texture-inferred fixtures (inset, strip, edge, hand)
+//   rt_lights_fx.cpp        switches, lava, flames
+//   rt_smoke.cpp            the muzzle/rocket puff volumes
+//
+// All of it used to sit inside the anonymous namespace that closes just above --
+// which is precisely why none of it could be moved before. Their entry points
+// are declared in rt_internal.h and are all still driven from one call site, in
+// RT_DrawFrame below.
 
 //
 //
@@ -3255,6 +2290,7 @@ void RT_UploadExportableSectorLights()
 
 // Special extension
 #define ext_RG_STRUCTURE_TYPE_START_FRAME_REMIX_PARAMS ( ( RgStructureType )1024 )
+
 struct ext_RgStartFrameRemixParams
 {
     RgStructureType sType;
@@ -3265,7 +2301,7 @@ struct ext_RgStartFrameRemixParams
     RgBool32        reflex;
 };
 
-void RTFrameBuffer::RT_BeginFrame()
+void rtx::RTFrameBuffer::RT_BeginFrame()
 {
     // HACKHACK begin
     if( g_rt_skipinitframes == -10 )
@@ -3290,6 +2326,11 @@ void RTFrameBuffer::RT_BeginFrame()
     m_state->RT_BeginFrame();
 
     classic_toggle::Animate();
+
+    // Which sectors a light thinker owns right now -- read by RT_EmisLightLevel
+    // during the world walk that follows, so it is refreshed before it, not in
+    // RT_DrawFrame with the rest of the light work.
+    RT_UpdateAnimatedSectorLights();
 
 
     auto resolution_params = RgStartFrameRenderResolutionParams{
@@ -3349,14 +2390,29 @@ void RTFrameBuffer::RT_BeginFrame()
     RgStaticSceneStatusFlags staticscene_status = 0;
     const bool ignore_external_geometry = RT_ShouldIgnoreExternalGeometry();
 
+    // Maps with no baked rt/scenes must not auto-export and must not be
+    // uncull-alled: export + uncull-all freezes the main thread while the whole
+    // map is uploaded at once, which is seen as a multi-second hang at the level
+    // transition (press EXIT, wait, THEN the intermission appears).
+    //
+    // THE TEST IS "HAS A BAKED SCENE", NOT "IS A PWAD". It used to be an
+    // underscore check on the map name, which protected Retribution's maps and
+    // left every IWAD map exposed -- harmless while IWAD maps took their geometry
+    // from a baked scene, and not harmless at all now that they upload live
+    // (see RT_ModMapNeedsLiveGeometryUpload). A stock DOOM II map uploading its
+    // whole world with culling disabled is the same stall, for the same reason.
+    const char* mapname_for_rt = RT_GetMapName();
+    const bool  is_mod_map     = RT_ModMapNeedsLiveGeometryUpload();
+    const bool  allow_autoexport = cvar::rt_autoexport && !is_mod_map;
+
     auto info = RgStartFrameInfo{
         .sType                  = RG_STRUCTURE_TYPE_START_FRAME_INFO,
         .pNext                  = &fluid_params,
-        .pMapName               = RT_GetMapName(),
+        .pMapName               = mapname_for_rt,
         .ignoreExternalGeometry = ignore_external_geometry,
         .vsync                  = cvar::rt_vsync,
         .hdr                    = cvar::rt_hdr_available ? cvar::rt_hdr : false,
-        .allowMapAutoExport     = cvar::rt_autoexport && !ignore_external_geometry,
+        .allowMapAutoExport     = allow_autoexport && !ignore_external_geometry,
         .lightmapScreenCoverage = RT_ForceNoClassicMode() ? 0.0f : cvar::rt_classic,
         .lightstyleValuesCount  = uint32_t( g_sectorlightlevels.size() ),
         .pLightstyleValues8     = g_sectorlightlevels.data(),
@@ -3365,22 +2421,32 @@ void RTFrameBuffer::RT_BeginFrame()
     };
     g_resetfluid = false;
 
+    // Doom64-RT: the frame's cost accounting starts here. Reset before
+    // rgStartFrame, because rgStartFrame is itself one of the four phases.
+    RT_StatsNewFrame();
+    RT_ApplyQualityPresetOnce();
+    RT_ReportPrecache();
+    RT_ReportLiquidConfig();
+
+    RTStartFrame.Clock();
     RgResult r = rt.rgStartFrame( &info );
+    RTStartFrame.Unclock();
     RG_CHECK( r );
 
 
-    auto l_clm = [ staticscene_status ]() {
-        if( staticscene_status & RG_STATIC_SCENE_STATUS_EXPORT_STARTED )
+    auto l_clm = [ staticscene_status, is_mod_map ]() {
+        // Doom64-RT: uncull-all (mode 2) on large UDMF mods freezes the main thread
+        // for a long time (looks hung; needs force-close). Never do it for mod maps.
+        if( !is_mod_map )
         {
-            return 2; // no cull as we need to upload all geometry for the first time
-        }
-        if( staticscene_status & RG_STATIC_SCENE_STATUS_NEW_SCENE_STARTED )
-        {
-            return 2; // touch everything, to upload all resources
-        }
-        if( !( staticscene_status & RG_STATIC_SCENE_STATUS_LOADED ) )
-        {
-            return 2; // no static scene, upload everything
+            if( staticscene_status & RG_STATIC_SCENE_STATUS_EXPORT_STARTED )
+            {
+                return 2; // no cull as we need to upload all geometry for the first time
+            }
+            if( staticscene_status & RG_STATIC_SCENE_STATUS_NEW_SCENE_STARTED )
+            {
+                return 2; // touch everything, to upload all resources
+            }
         }
         switch( int( cvar::rt_cpu_cullmode ) )
         {
@@ -3393,20 +2459,159 @@ void RTFrameBuffer::RT_BeginFrame()
     rt_cullmode = l_clm();
 }
 
-void RTFrameBuffer::RT_DrawFrame()
+
+// Doom64-RT: say out loud when a DEBUG VIEW is repainting the image.
+//
+// Every one of these is NOARCH, so a value typed in the console leaves no trace
+// in the ini and none in the pins -- there is nothing to grep afterwards. Two
+// separate sessions have now been spent asking "was a debug view on?" about a
+// magenta light, with the answer unobtainable either way. So the renderer says
+// so itself, and says it again whenever the set changes.
+//
+// Only views that REPAINT LIGHTING are listed. A console dump or a marker sphere
+// is additive and does not lie about the image; these replace what you are
+// looking at, which is exactly what makes them mistakable for the effect.
+static void RT_WarnDebugViews()
 {
+    const struct
+    {
+        const char* name;
+        int         value;
+        const char* effect;
+    } views[] = {
+        { "rt_svgf_fp",          int( cvar::rt_svgf_fp ) == 2 ? 2 : 0,
+          "borrowed denoiser pixels painted MAGENTA (any sprite silhouette)" },
+        { "rt_debug_visibility", int( cvar::rt_debug_visibility ),
+          "shadow term instead of radiance; 2 tints shadowed pixels RED" },
+        { "rt_debug_show",       int( cvar::rt_debug_show ),
+          "raw denoiser layer instead of the final image" },
+        { "rt_lava_debug",       int( cvar::rt_lava_debug ) ? 1 : 0,
+          "every lava surface painted MAGENTA" },
+        { "rt_smoke_debug",      int( cvar::rt_smoke_debug ) == 2 ? 2 : 0,
+          "froxels covered by a puff painted MAGENTA" },
+        { "rt_debug_restir_m",   int( cvar::rt_debug_restir_m ),
+          "ReSTIR reservoir M as a green ramp instead of radiance" },
+    };
+
+    FString now;
+    for( const auto& v : views )
+    {
+        if( v.value != 0 )
+        {
+            now.AppendFormat( "  %s %d -- %s\n", v.name, v.value, v.effect );
+        }
+    }
+
+    // The sentinel matters: with a default-constructed s_last, an empty `now` on
+    // the FIRST call compares equal and returns before printing anything -- so
+    // the one case the line exists for, "confirm no debug view is on", said
+    // nothing at all. Start from a value no report can produce.
+    static FString s_last = "";
+    if( now.Compare( s_last ) == 0 )
+    {
+        return;
+    }
+    s_last = now;
+    if( now.IsEmpty() )
+    {
+        Printf( "RT debug views: none (the image is the real render)\n" );
+    }
+    else
+    {
+        Printf( "\n*** RT DEBUG VIEW ACTIVE -- WHAT YOU SEE IS NOT THE REAL RENDER ***\n%s\n",
+                now.GetChars() );
+    }
+}
+
+void rtx::RTFrameBuffer::RT_DrawFrame()
+{
+    // Sky primitives are collected as the renderer walks the BSP, so the list
+    // has to roll over once per frame or it just grows.
+    RT_SkyPrimsEndFrame();
+
     const double   curtime      = RT_GetCurrentTime();
     const uint32_t powerupflags = RT_CalcPowerupFlags();
 
     RT_DrawTitle();
 
-    if( bool{ cvar::rt_sun } && float{ cvar::rt_sun_intensity } > 0 )
+    // THE directional light -- singular, and that is a hard constraint, not a
+    // simplification. RTGL1's LightManager::Add answers a second directional
+    // light with debug::Error("Only one directional light is allowed"), and
+    // debug::Error exits the game. Uploading lightning as its own light took
+    // MAP11 down on the first strike.
+    //
+    // So the moon and the storm SHARE this slot, and the brighter one wins.
+    // That is not a compromise: a strike peaks at rt_lightning_intensity 2200
+    // against the moon's 90, and the handover happens exactly where the two are
+    // equal, so there is no pop at either end -- the moon's shafts are replaced
+    // only while something 20x brighter is standing in for them, and come back
+    // as the flash decays past them. Both ends of the strike cross that point
+    // continuously.
     {
-        float altitude = to_rad( float{ cvar::rt_sun_a } );
-        float azimuth  = to_rad( float{ cvar::rt_sun_b } );
+        // The moon, dimmed by whatever cloud is currently in front of it. The
+        // deck is sky geometry -- rasterised into the cubemap, never in the
+        // acceleration structure -- so it cannot cast a shadow on its own and
+        // the moon would otherwise pour through an overcast sky at full
+        // strength. RT_DrawCloudDeck walks the moon's own ray up through the
+        // shells and reports what gets through; see the comment there.
+        // Per channel, so the deck's COLOUR reaches the light: moonlight under a
+        // purple overcast arrives purple. The intensity carries the luminance of
+        // that transmittance and the colour carries its hue, because
+        // RgLightDirectionalEXT keeps the two separate -- splitting it any other
+        // way would make a saturated tint quietly dim the light as well.
+        const float tR = g_cloudSunTransmittance[ 0 ];
+        const float tG = g_cloudSunTransmittance[ 1 ];
+        const float tB = g_cloudSunTransmittance[ 2 ];
+        const float tLum = std::max( 0.02f, 0.2126f * tR + 0.7152f * tG + 0.0722f * tB );
 
-        float theta = std::clamp( pi() / 2 - altitude, 0.f, pi() );
-        float phi   = std::fmod( azimuth, pi() * 2 );
+        const float sunI = ( bool{ cvar::rt_sun } && float{ cvar::rt_sun_intensity } > 0.f )
+                             ? float{ cvar::rt_sun_intensity } * tLum
+                             : 0.f;
+
+        float ltngI   = 0.f;
+        float ltngAzi = 0.f, ltngAlt = 0.f;
+        // The LIGHT's envelope, which carries the afterglow tail the visible
+        // flash does not (rt_lightning_afterglow).
+        if( const float flash = RT_LightningLightLevel(); flash > 0.002f )
+        {
+            RT_LightningAim( &ltngAzi, &ltngAlt, nullptr );
+            ltngI = std::max( 0.f, float{ cvar::rt_lightning_intensity } ) * flash;
+        }
+
+        const bool useLightning = ltngI > sunI;
+        // Read by RT_VCloudsParams (built further down this function): the
+        // clouds must not occlude a strike, which is inside the deck.
+        g_rtSunIsLightning = useLightning;
+
+        if( useLightning || sunI > 0.f )
+        {
+        const float intensity = useLightning ? ltngI : sunI;
+
+        // The moon's own colour, multiplied by the cloud transmittance's HUE
+        // (its luminance already went into sunI above, so it is divided back out
+        // here -- otherwise the dimming would be applied twice). Lightning is
+        // not filtered: the strike is inside or under the deck, not behind it.
+        const auto color = [ & ] {
+            if( useLightning )
+            {
+                return cvarcolor_to_rtcolor( cvar::rt_lightning_color );
+            }
+            const uint32_t sc = *( cvar::rt_sun_color );
+            return rt.rgUtilPackColorFloat4D(
+                std::clamp( ( RPART( sc ) / 255.f ) * ( tR / tLum ), 0.f, 1.f ),
+                std::clamp( ( GPART( sc ) / 255.f ) * ( tG / tLum ), 0.f, 1.f ),
+                std::clamp( ( BPART( sc ) / 255.f ) * ( tB / tLum ), 0.f, 1.f ),
+                1.f );
+        }();
+        const float angdiam   = useLightning
+                                  ? std::clamp( float{ cvar::rt_lightning_angdiam }, 0.01f, 90.f )
+                                  : std::clamp( float{ cvar::rt_sun_angdiam }, 0.01f, 90.f );
+
+        float altitude = to_rad( useLightning ? ltngAlt : float{ cvar::rt_sun_a } );
+        float azimuth  = to_rad( useLightning ? ltngAzi : float{ cvar::rt_sun_b } );
+
+        float theta = std::clamp( rt_pi() / 2 - altitude, 0.f, rt_pi() );
+        float phi   = std::fmod( azimuth, rt_pi() * 2 );
 
         // negate, direction from the sun, not towards the sun
         auto dir = RgFloat3D{
@@ -3415,15 +2620,52 @@ void RTFrameBuffer::RT_DrawFrame()
             -cos( theta ),
         };
 
+        if( useLightning && int{ cvar::rt_lightning_debug } )
+        {
+            Printf( "rt_lightning: directional -> lightning %.0f (moon %.0f), az %.0f alt %.0f\n",
+                    ltngI, sunI, ltngAzi, ltngAlt );
+        }
+
         auto s = RgLightDirectionalEXT{
             .sType                  = RG_STRUCTURE_TYPE_LIGHT_DIRECTIONAL_EXT,
             .pNext                  = nullptr,
-            .color                  = cvarcolor_to_rtcolor( cvar::rt_sun_color ),
-            .intensity              = float{ cvar::rt_sun_intensity },
+            .color                  = color,
+            .intensity              = intensity,
             .direction              = dir,
-            .angularDiameterDegrees = 0.5f,
+            // The size gate for sky leaks, and the reason it is an ANGLE.
+            //
+            // At 0.5 degrees -- the real moon -- this light is effectively a
+            // point, so its shadow ray is a single yes/no test. One unblocked
+            // ray through a hand-width crack delivers exactly as much light as
+            // an open doorway, which is why a pinhole leak reads as a full-
+            // strength shaft and why no per-surface rule could fix it: the wall
+            // holes MAP13 wants lit and the cracks it does not are the same kind
+            // of geometry.
+            //
+            // Widen the disc and the test stops being binary. RTGL1 samples a
+            // point on it per shadow ray (sampleDirectionalLight -> sampleDisk),
+            // so an opening now admits light in proportion to how much of the
+            // disc it actually reveals. A doorway reveals all of it and is
+            // unchanged; a narrow band reveals a sliver and dims smoothly.
+            //
+            // Crucially it also falls off with DISTANCE, which is the behaviour
+            // actually wanted here: an opening of size d seen from L away
+            // subtends d/L, so the same band still lights the surfaces beside it
+            // and stops washing a ceiling 2000 units off. That is a soft
+            // rolloff, not a cutoff -- "too small a hole" is only meaningful
+            // relative to how far away you are standing, so a hard threshold
+            // could not have been right at any single value.
+            //
+            // Costs sharpness on the wanted shafts too: this is one knob for
+            // both, traded with rt_sun_angdiam. During a strike this is
+            // rt_lightning_angdiam instead -- deliberately much wider; see there.
+            .angularDiameterDegrees = angdiam,
         };
 
+        // ONE id for both, so there is only ever one directional light alive.
+        // Reusing SunLightId also means the swap is a parameter change on a
+        // light RTGL1 already knows, rather than a light appearing and another
+        // disappearing in the same frame.
         auto i = RgLightInfo{
             .sType        = RG_STRUCTURE_TYPE_LIGHT_INFO,
             .pNext        = &s,
@@ -3433,9 +2675,131 @@ void RTFrameBuffer::RT_DrawFrame()
 
         RgResult r = rt.rgUploadLight( &i );
         RG_CHECK( r );
+        }
     }
 
+    // The renderer never writes the player (pitch, position, flags) -- AGENTS.md.
+    if( primaryLevel && ( int{ cvar::rt_autoshot } > 0 || int{ cvar::rt_autoquit } > 0 ) )
+    {
+        const int t = primaryLevel->maptime;
+        static int s_shotAt = -1;
+        static int s_quitAt = -1;
+        if( int{ cvar::rt_autoshot } > 0 && t >= int{ cvar::rt_autoshot } && s_shotAt != t )
+        {
+            s_shotAt = t;
+            static int s_lastShot = -100000;
+            const int  every      = std::max( 0, int{ cvar::rt_autoshot_every } );
+            if( s_lastShot < 0 || ( every > 0 && t - s_lastShot >= every ) )
+            {
+                s_lastShot = t;
+                Printf( "rt_autoshot: screenshot at maptime %d\n", t );
+                AddCommandString( "screenshot" );
+            }
+        }
+        if( int{ cvar::rt_autoquit } > 0 && t >= int{ cvar::rt_autoquit } && s_quitAt != t )
+        {
+            s_quitAt = t;
+            static bool s_quitDone = false;
+            if( !s_quitDone )
+            {
+                s_quitDone = true;
+                Printf( "rt_autoquit: quitting at maptime %d\n", t );
+                AddCommandString( "quit" );
+            }
+        }
+    }
+
+    // BEFORE the fixture walks: they offer their lights into this list as they
+    // upload them, and RT_ShaftLightsSelect() reads it when the volumetric
+    // params are built further down. See rt_light_shafts.cpp.
+    // Doom64-RT: everything from here to RT_DebugNearbyWallTextures() is OUR
+    // per-frame light generation -- ten systems, each walking the whole level.
+    // Timed as one block because that is the unit a fix would move: see
+    // rt_stats.h and the Stage 2 fixture-candidate bake.
+    RTLightGen.Clock();
+
+    RT_ShaftLightsBegin();
+
     RT_UploadExportableSectorLights();
+    RT_UploadGzDoomDynamicLights();
+    RT_UploadCeilingInsetLamps();
+    RT_UploadHangingTechLamps();
+    RT_WarnDebugViews();
+    RT_UploadHandGlowLights();
+    RT_UploadFlameLights();
+    RT_UploadLavaLights();
+    // Doom64-RT: put the player on a blood pool on the first frame of a map that
+    // has one. It has to be here rather than a "+rt_blood_goto" on the command
+    // line: those run before the level exists, so the CCMD would report "no
+    // level" and the launcher would look like it had worked. Same reason
+    // rt_lava_autogoto lives inside RT_UploadLavaLights.
+    // Doom64-RT: put the player on a blood pool, hands-free. FIRED FOUR TIMES
+    // across the first ~3.5 seconds, and that is the fix for a bug that cost a
+    // day of measurements: a single teleport on an early frame runs, SetOrigin
+    // is called, "moved you there" prints -- and Retribution's map-start intro
+    // (the act title window) re-places the player afterwards, so every capture
+    // "from the pool" was actually from the spawn. The CCMD is idempotent, so
+    // repeating it is free; the last shot lands after the intro is done.
+    // Fires FOUR times over the first ~3.5s of maptime, not once: Retribution's
+    // act title card re-positions the player after spawn, so a single early
+    // move is silently undone and looks exactly like the CCMD not working.
+    if( ( cvar::rt_blood_autogoto || cvar::rt_sludge_autogoto ) && primaryLevel )
+    {
+        const int          t     = primaryLevel->maptime;
+        static const void* s_lvl = nullptr;
+        static int         s_fired;
+        if( s_lvl != primaryLevel )
+        {
+            s_lvl   = primaryLevel;
+            s_fired = 0;
+        }
+        if( s_fired < 4 && t >= 10 + s_fired * 35 )
+        {
+            s_fired++;
+            AddCommandString( cvar::rt_sludge_autogoto ? "rt_sludge_goto"
+                                                       : "rt_blood_goto" );
+        }
+    }
+    RT_UploadSwitchLights();
+    RT_UpdateSectorEmisThreshold();
+    RT_WatchLightlevels();
+    RT_UploadWallStripLights();
+    RT_UploadSpinPanelLights();
+    RT_UploadCeilingEdgeLamps();
+    RTLightGen.Unclock();
+
+    // The effect systems. Separate from the light walks above because they grow
+    // with the persistent particle pool -- casings, debris, scorch marks -- and
+    // the light walks grow with the level. Measured 0.4 -> 1.6 ms across 40s of
+    // sustained fire before this split existed to attribute it.
+    RTFx.Clock();
+
+    RT_UpdateSmokePuffs();
+    // Impact sparks, in this order: step the pool, draw it, then light it. The
+    // draw has to follow the sim or the batch is a frame stale, and the lights
+    // follow the draw only so the debug ladder's C/sent line counts both.
+    //
+    // The projectile walk goes FIRST, so an arc spawned by an impact this tic is
+    // stepped and drawn in the same frame rather than one late. It shares the
+    // spark pool, which is why it belongs to this block and not beside the smoke
+    // walk it deliberately does not hook into.
+    RT_UpdateProjectileImpacts();
+    RT_UpdateSparks();
+    RT_DrawSparks();
+    // Dust motes. After the sparks so both batches are built in one place, and
+    // stateless -- there is nothing to step, so there is no Update half.
+    RT_DrawDust();
+    // The fire sky's meteor pool and its two schedulers. Stepped HERE and not
+    // in the sky draw: a sealed room submits no sky portal, and scheduling
+    // strikes there would stop the storm exactly while the player is indoors,
+    // which is where a flash through a doorway is worth most. The meteor QUADS
+    // are drawn from hw_skyportal.cpp, which owns the sky vertex buffer.
+    RT_FireSkyTick();
+    RT_UploadSparkLights();
+    RT_SparkDebugTick();
+    RT_DebugNearbyWallTextures();
+
+    RTFx.Unclock();
 
     auto tm_params = RgDrawFrameTonemappingParams{
         .sType                = RG_STRUCTURE_TYPE_DRAW_FRAME_TONEMAPPING_PARAMS,
@@ -3458,6 +2822,13 @@ void RTFrameBuffer::RT_DrawFrame()
                                   cvar::rt_hdr_saturation },
     };
 
+    // 0..255 cvar triple -> RgFloat3D. The liquid palette is 24 of these.
+    auto l_col255 = []( int r, int g, int b ) {
+        return RgFloat3D{ std::clamp( r / 255.f, 0.f, 1.f ),
+                          std::clamp( g / 255.f, 0.f, 1.f ),
+                          std::clamp( b / 255.f, 0.f, 1.f ) };
+    };
+
     auto reflrefr_params = RgDrawFrameReflectRefractParams{
         .sType                   = RG_STRUCTURE_TYPE_DRAW_FRAME_REFLECT_REFRACT_PARAMS,
         .pNext                   = &tm_params,
@@ -3465,44 +2836,637 @@ void RTFrameBuffer::RT_DrawFrame()
         .typeOfMediaAroundCamera = RG_MEDIA_TYPE_VACUUM,
         .indexOfRefractionGlass  = cvar::rt_refr_glass,
         .indexOfRefractionWater  = cvar::rt_refr_water,
-        .waterWaveSpeed          = 0.05f,                    // for partial_invisibility
-        .waterWaveNormalStrength = cvar::rt_water_wavestren, // for partial_invisibility
+        .waterWaveSpeed          = cvar::rt_water_wavespeed,
+        .waterWaveNormalStrength = cvar::rt_water_wavestren,
         .waterColor              = { std::clamp( *cvar::rt_water_r / 255.f, 0.f, 1.f ),
                                      std::clamp( *cvar::rt_water_g / 255.f, 0.f, 1.f ),
                                      std::clamp( *cvar::rt_water_b / 255.f, 0.f, 1.f ) },
         .waterWaveTextureDerivativesMultiplier = 1.0f,
-        .waterTextureAreaScale                 = 1.0f,
+        .waterTextureAreaScale                 = cvar::rt_water_areascale,
         .portalNormalTwirl                     = false,
+        // Doom64-RT stylized water — see rt_water_style.
+        .stylizedWaterStrength  = cvar::rt_water_style ? 1.0f : 0.0f,
+        .stylizedWaterCaustic   = cvar::rt_water_caustic,
+        .stylizedWaterReflMax   = cvar::rt_water_reflmax,
+        .stylizedWaterRoughness = cvar::rt_water_rough,
+        .stylizedWaterGlow      = cvar::rt_water_glow,
+        .stylizedWaterVeinRef   = cvar::rt_water_veinref,
+        // Indexed by the liquid id l_waterflag() packs into the primitive
+        // flags: 0 water, 1 nukage, 2 sludge, 3 blood. Order matters.
+        .stylizedLiquidTint     = { l_col255( cvar::rt_water_tint_r,
+                                              cvar::rt_water_tint_g,
+                                              cvar::rt_water_tint_b ),
+                                    l_col255( cvar::rt_nukage_tint_r,
+                                              cvar::rt_nukage_tint_g,
+                                              cvar::rt_nukage_tint_b ),
+                                    l_col255( cvar::rt_sludge_tint_r,
+                                              cvar::rt_sludge_tint_g,
+                                              cvar::rt_sludge_tint_b ),
+                                    l_col255( cvar::rt_blood_tint_r,
+                                              cvar::rt_blood_tint_g,
+                                              cvar::rt_blood_tint_b ) },
+        .stylizedLiquidCrest    = { l_col255( cvar::rt_water_crest_r,
+                                              cvar::rt_water_crest_g,
+                                              cvar::rt_water_crest_b ),
+                                    l_col255( cvar::rt_nukage_crest_r,
+                                              cvar::rt_nukage_crest_g,
+                                              cvar::rt_nukage_crest_b ),
+                                    l_col255( cvar::rt_sludge_crest_r,
+                                              cvar::rt_sludge_crest_g,
+                                              cvar::rt_sludge_crest_b ),
+                                    l_col255( cvar::rt_blood_crest_r,
+                                              cvar::rt_blood_crest_g,
+                                              cvar::rt_blood_crest_b ) },
+        // Same 0..3 order. Blood and sludge have authored relief
+        // (d64r-liquid-art.wad + tools/gen_liquid_art.py); only blood has a
+        // flow map. Water and nukage keep the water wave and are unchanged.
+        .stylizedLiquidRelief   = { 0.f, 0.f, cvar::rt_sludge_relief, cvar::rt_blood_relief },
+        .stylizedLiquidFlow     = { 0.f, 0.f, 0.f, cvar::rt_blood_flow },
+        // Per-liquid reflection. 1 and 0 are "unchanged": 1 keeps the whole
+        // stylized Fresnel curve, and a roughness of 0 falls back to
+        // rt_water_rough. Only WATER is still a literal 1: it is the liquid the
+        // stylized Fresnel curve was authored for, and the one thing in the game
+        // that should reflect a room. The other three each pull their own value
+        // down (sludge 0, blood 0.3, nukage 0.5) because a mirror is what sells
+        // WATER, and wearing it is what made mud, gore and poison read as water
+        // with paint in it. A refl of exactly 0 also takes that liquid off the
+        // checkerboard split -- see rt_liquid_checkerboard; a fraction does not.
+        // Roughness stays paired with an AUTHORED normal: only sludge and blood
+        // have one, so nukage has no rt_nukage_rough to give it.
+        .stylizedLiquidRefl     = { 1.f,
+                                    cvar::rt_nukage_refl,
+                                    cvar::rt_sludge_refl,
+                                    cvar::rt_blood_refl },
+        .stylizedLiquidRough    = { 0.f, 0.f, cvar::rt_sludge_rough, cvar::rt_blood_rough },
+        // Options > Quality "Liquid surfaces": 0 = full-res, no mirror, for ALL
+        // four liquids. A liquid whose refl is 0 takes that path regardless.
+        .liquidNoSplit          = cvar::rt_liquid_checkerboard ? 0.f : 1.f,
+        // Only water projects caustics now. Nukage, sludge and blood all wear
+        // opaque reference art, and a caustic is light refracted THROUGH a
+        // fluid onto what is beyond it. Scales rt_water_caustics, does not
+        // replace it.
+        .stylizedLiquidCaustics = { 1.f,
+                                    cvar::rt_nukage_caustics,
+                                    cvar::rt_sludge_caustics,
+                                    cvar::rt_blood_caustics },
+        .liquidFlowSpeed        = cvar::rt_blood_flow_speed,
+        .liquidFlowScale        = cvar::rt_blood_flow_scale,
+        .liquidFlowAspect       = cvar::rt_blood_flow_aspect,
+        .liquidFlowDebug        = cvar::rt_blood_flow_debug ? 1.f : 0.f,
+        .lavaEmisBoost          = std::max( 0.f, float{ cvar::rt_lava_emis } ),
+        .lavaFlowStrength       = std::clamp( float{ cvar::rt_lava_flow }, 0.f, 1.f ),
+        .lavaFlowSpeed          = cvar::rt_lava_flow_speed,
+        .lavaFlowScale          = cvar::rt_lava_flow_scale,
+        .lavaFlowPixel          = cvar::rt_lava_flow_pixel,
+        .lavaPulse              = std::clamp( float{ cvar::rt_lava_pulse }, 0.f, 1.f ),
+        .lavaPulseSpeed         = cvar::rt_lava_pulse_speed,
+        .lavaGiBoost            = std::max( 0.f, float{ cvar::rt_lava_gi } ),
+        .lavaDebug              = cvar::rt_lava_debug ? 1.f : 0.f,
+
+        .lavaTint               = l_col255( cvar::rt_lava_tint_r,
+                                            cvar::rt_lava_tint_g,
+                                            cvar::rt_lava_tint_b ),
+        .stylizedWaterDebug     = float( *cvar::rt_water_debug ),
+        .stylizedWaterReflMin   = cvar::rt_water_reflmin,
+        .waterCausticGain       = cvar::rt_water_caustics,
+        .waterCausticScale      = cvar::rt_water_caustic_scale,
+        .waterCausticSpeed      = cvar::rt_water_caustic_speed,
+        // map units -> metres: RTGL world space is metres. Passing map units
+        // straight through made the probe ray 6144 m long, so a wall anywhere
+        // above any water in the map got lit.
+        .waterCausticDist       = cvar::rt_water_caustic_dist * ONEGAMEUNIT_IN_METERS,
+        .waterCausticRise       = cvar::rt_water_caustic_rise * ONEGAMEUNIT_IN_METERS,
+        .waterCausticSlant      = cvar::rt_water_caustic_slant,
+        .waterCausticWallBoost  = cvar::rt_water_caustic_wall,
     };
 
     auto sky_params = RgDrawFrameSkyParams{
         .sType              = RG_STRUCTURE_TYPE_DRAW_FRAME_SKY_PARAMS,
         .pNext              = &reflrefr_params,
         .skyType            = m_wassky ? RG_SKY_TYPE_RASTERIZED_GEOMETRY : RG_SKY_TYPE_COLOR,
-        .skyColorDefault    = { 0, 0, 0 },
+        // Dark space tint if raster sky failed (pure black often tonemaps to white voids).
+        .skyColorDefault    = { 0.02f, 0.02f, 0.05f },
         .skyColorMultiplier = cvar::rt_sky,
         .skyColorSaturation = cvar::rt_sky_saturation,
         .skyViewerPosition  = { 0, 0, 0 },
+        .sunRequireSky      = bool{ cvar::rt_sun_require_sky } ? 1.f : 0.f,
+        .sunLeakDebug       = float( std::clamp( int{ cvar::rt_sun_leak_debug }, 0, 2 ) ),
+        // RTGL folds intensity into the light's colour before the shader sees it,
+        // so a debug colour of 1.0 would arrive ~90x dimmer than the moon and be
+        // invisible in exactly the near-black rooms this is for. Carry the
+        // intensity across so red and blue read at the same strength the moon does.
+        .sunLeakDebugMul    = std::max( 1.f, float{ cvar::rt_sun_intensity } ),
+        .sunSkyProbeMaxDist = std::max( 0.f, float{ cvar::rt_sun_skyprobe_dist } ),
+        .sunSplit           = bool{ cvar::rt_sun_split } ? 1.f : 0.f,
+    };
+
+    // Doom64-RT: the map's own fog, if it has any. A fogged map REPLACES the
+    // global rt_volume_* values rather than adding to them -- two densities
+    // stacked is a fog nobody authored, and it would make the global knobs mean
+    // something different on nine maps than on the other twenty-three.
+    RT_ResolveFogIfPending();
+    const ResolvedFog fog = RT_ResolveFog();
+
+    // Doom64-RT: LOCALISED SMOKE. Its own struct on the pNext chain, so a frame
+    // with no puffs -- which is every frame until someone fires -- reaches RTGL1
+    // with puffCount 0, and the froxel shader collapses back to exactly the
+    // fog's arithmetic. The four guarded edits inside volumetrics_params below
+    // are all `fog.on ? <the value that shipped> : ...`, so a fogged map takes
+    // the branch it has always taken and smoke cannot retune it.
+    RgFloat4D smoke_puffs[ RG_MAX_SMOKE_PUFFS ]{};
+    RgFloat4D smoke_albden[ RG_MAX_SMOKE_PUFFS ]{};
+    RgFloat4D smoke_shape[ RG_MAX_SMOKE_PUFFS ]{};
+    uint32_t  smoke_count = 0;
+
+    const uint32_t smoke_budget =
+        uint32_t( std::clamp( int{ cvar::rt_smoke_budget }, 0, int{ RG_MAX_SMOKE_PUFFS } ) );
+
+    // ONE predicate for both the reach below and the packing loop. Splitting
+    // them let `rt_smoke_budget 0` shorten the volume without sending a single
+    // puff -- which on an unfogged map is rt_volume_scatter's density over 14 m
+    // instead of 30, i.e. a visibly thicker global haze from the arm meant to
+    // turn smoke OFF.
+    const bool smoke_live = cvar::rt_smoke && g_smokePuffCount > 0 && smoke_budget > 0;
+
+    // Smoke may only take the volume OVER when nothing else is in it -- no fog
+    // AND no global rt_volume_* medium. Anything less and firing the gun rewrites
+    // the settings of a medium somebody else is using: the first version tested
+    // only !fog.on, so on any unfogged map a shot set the global density to 0 and
+    // the reach from 30 m to 14, and the moon's light shafts -- which ARE that
+    // medium being scattered -- vanished for as long as the trigger was down.
+    //
+    // Smoke ADDS to whatever is already there. That is the whole design, it is
+    // what the density-weighted blend in Smoke.h is for, and this predicate is
+    // where the engine has to honour it.
+    const bool smoke_owns = !fog.on && cvar::rt_volume_type == 0 && smoke_live;
+
+    // The volume's reach this frame, decided before the puffs are packed because
+    // the density scale below depends on it. Fog always wins, and the global
+    // medium wins over smoke for the same reason: shortening the reach while
+    // someone else's medium is in the volume would silently thicken it too,
+    // because its density is per CELL and the cells would get shorter
+    // (rt-fog.md S6).
+    const float smoke_far = fog.on       ? fog.far_m
+                            : smoke_owns ? float{ cvar::rt_smoke_far }
+                                         : float{ cvar::rt_volume_far };
+
+    // ...and the same coupling, applied to the GLOBAL medium's own density.
+    //
+    // RtVolumetric.rgen multiplies its coefficient per CELL and the grid is 64
+    // slices whatever the reach, so rt_volume_far is a density knob as much as a
+    // reach one: raising it 30 -> 60 for smoke's render distance doubled the
+    // slice thickness, which halved how many cells a shaft crosses, which halved
+    // the light scattered out of it. Reported from play as the moon's shafts
+    // going weak on MAP01 after the smoke work, and visible from IN FRONT of the
+    // opening only -- looking up along the beam the phase function's ~11x
+    // forward bias still carried it, which is what made the report read as a
+    // contradiction rather than as a dimming.
+    //
+    // So rt_volume_scatter is normalised into a per-METRE density here, against
+    // the 30 m reach it was tuned at. Same reasoning, and the same arithmetic,
+    // as the slice thickness smoke already pays a few lines below -- smoke was
+    // immune to this precisely because it pays it, which is why the moon was the
+    // only thing that changed.
+    //
+    // FOG IS NOT NORMALISED, deliberately. It has its own tuned pair
+    // (rt_fog_far / rt_fog_density) on nine maps, RT_FOG_PRESETS is stated in
+    // those units, and rt-fog.md S6 documents the coupling as part of the
+    // contract. Touching it would retune every fogged map for a MAP01 report;
+    // ab-smoke.cmd fogsafe asserts it did not.
+    constexpr float RT_VOLUME_REF_FAR = 30.f;
+
+    // NO GLOBAL HAZE UNDER A FIRE SKY. On the five fire maps (and wherever
+    // rt_fireskies_new is on) the medium is cut to zero: a grey scattering
+    // haze lit by the overhead light reads as fog over the sky, which is the
+    // opposite of a burning one (MAP23, 2026-08-23). The cvar itself is not
+    // written -- it is CVAR_ARCHIVE and every other map wants it -- this is
+    // the effective value only. Fog presets and smoke are untouched.
+    const bool  fire_sky    = RT_FireSkyMap() || RT_FireSkyActive();
+    const float volume_dens = fire_sky ? 0.f
+                                       : float{ cvar::rt_volume_scatter } *
+                                             ( std::max( 0.001f, smoke_far ) / RT_VOLUME_REF_FAR );
+
+    if( smoke_live )
+    {
+        // rt_smoke_density is optical depth per METRE, but RtVolumetric.rgen
+        // applies a flat coefficient per CELL -- which is why rt_fog_far
+        // silently changes what a fog density means (rt-fog.md S6). Paying the
+        // slice thickness here instead means a puff looks the same whatever the
+        // volume's reach is, including on a fogged map where it is not ours.
+        //
+        // 64 is VOLUMETRIC_SIZE_Z. It is generated into RTGL1's private
+        // ShaderCommonC.h and not exported through RTGL1.h, so it has to be
+        // restated here; if the grid depth ever changes, this is the second
+        // place. The slices are uniform in distance (VOLUMETRIC_DISTANCE_POW 1),
+        // which is what makes one thickness correct for the whole volume.
+        constexpr int RT_VOLUME_SLICES = 64;
+
+        const float sliceM = std::max( 0.001f, smoke_far / float( RT_VOLUME_SLICES ) );
+
+        const uint32_t hex = uint32_t( cvar::rt_smoke_color );
+        const FVector3 col{ float( ( hex >> 16 ) & 0xFF ) / 255.0f,
+                            float( ( hex >> 8 ) & 0xFF ) / 255.0f,
+                            float( hex & 0xFF ) / 255.0f };
+
+        // ...and the shader multiplies what we send by RT_VOLUME_CELL_COEFF per
+        // cell. Both factors are needed: cells-per-metre is 1/sliceM and the
+        // coefficient is 0.001, so density_uniform = k * sliceM / 0.001. Sending
+        // only k*sliceM -- which is what the first version did -- is a THOUSAND
+        // times too thin: tau across a whole puff comes out at 0.002 and the
+        // smoke is mathematically invisible, which is precisely how it looked.
+        constexpr float RT_VOLUME_CELL_COEFF = 0.001f;
+
+        // The per-metre density now lives on the PUFF (captured at spawn with its
+        // weapon's multiplier applied), so two weapons' smoke can be in the air
+        // at once at different densities. Only the grid conversion is shared.
+        const auto& vpos = r_viewpoint.Pos;
+        const auto  eye  = FVector3{ float( vpos.X ), float( vpos.Y ), float( vpos.Z ) } *
+                          ONEGAMEUNIT_IN_METERS;
+
+        // Nearest-first, then take the budget: with more puffs than the uniform
+        // can carry, the ones to keep are the ones in front of your face.
+        struct Cand
+        {
+            float    d2;
+            uint32_t idx;
+        };
+        std::array< Cand, RG_MAX_SMOKE_PUFFS > cand{};
+        uint32_t                               ncand = 0;
+        for( uint32_t i = 0; i < g_smokePuffCount; i++ )
+        {
+            cand[ ncand++ ] = Cand{ float( ( g_smokePuffs[ i ].pos - eye ).LengthSquared() ), i };
+        }
+
+        if( ncand > smoke_budget )
+        {
+            std::partial_sort( cand.begin(),
+                               cand.begin() + smoke_budget,
+                               cand.begin() + ncand,
+                               []( const Cand& a, const Cand& b ) { return a.d2 < b.d2; } );
+            ncand = smoke_budget;
+        }
+
+        for( uint32_t i = 0; i < ncand; i++ )
+        {
+            const SmokePuff& puff = g_smokePuffs[ cand[ i ].idx ];
+
+            // Conserve the parcel: as it expands, thin it out. Exponent ONE, not
+            // two -- what a ray collects is optical DEPTH, density x path length,
+            // so density ~ 1/r holds the depth through the core CONSTANT as the
+            // parcel spreads. At 1/r^2 the depth falls as 1/r on top of the
+            // (1-t)^2 age fade, the two compound, and a wisp that grows 8x over
+            // its life disappears entirely -- which is what happened.
+            const float dilute =
+                puff.radius > puff.radius0 ? ( puff.radius0 / puff.radius ) : 1.f;
+
+            const float t = std::clamp( puff.age / puff.life, 0.f, 1.f );
+            // (1 - t)^2: a puff spends its last third nearly gone, so it thins
+            // out rather than blinking off at the end of its life.
+            const float fade = ( 1.f - t ) * ( 1.f - t );
+
+            // A PUFF IS AN ELLIPSOID, NOT A SPHERE, and that is what lets a
+            // filament be a filament.
+            //
+            // The froxel grid's two axes differ by a factor of forty: at 1.5 m
+            // one cell is 1.7 cm across the screen and 47 cm deep. A sphere has
+            // ONE radius, so to be resolvable in depth it needs half a slice --
+            // and that same 23 cm is then its width on screen. That is why the
+            // pistol kept coming back as a ball however small the profile asked
+            // for: the depth requirement was setting the visible size.
+            //
+            // So the two radii are sent separately. Across the view the puff is
+            // exactly what the profile asked for -- centimetres, if that is what
+            // it wants. Along the view it is padded to half a slice, which is
+            // invisible because it is the axis you are looking down.
+            //
+            // SUB-GRID PUFFS MUST NOT VANISH.
+            //
+            // The volume's slices are sliceM apart along the view, so a puff
+            // thinner than about one slice can fall BETWEEN two sample points
+            // and contribute to no cell at all -- it does not render faint, it
+            // renders nothing, intermittently. That is what a thin per-weapon
+            // profile (the pistol's filament) runs into: 0.17 m radius against
+            // 0.47 m slices is 0.7 cells across its whole diameter.
+            //
+            // So widen it to the smallest footprint the grid can actually carry
+            // and DIVIDE THE DENSITY BY THE SAME FACTOR, which keeps the optical
+            // depth through the puff unchanged. The wisp reads slightly softer
+            // than authored instead of blinking in and out, and the number the
+            // profile asked for still means what it says.
+            // 0.5 of a slice, not 0.75. At 0.75 the floor is 0.35 m -- exactly
+            // the default radius -- so EVERY small profile was quietly widened
+            // back to the default and the pistol's filament came back fat. Half
+            // a slice still guarantees a cell centre can land inside the puff
+            // (centres are one slice apart, so a diameter of one slice cannot be
+            // stepped over) while letting a thin profile stay visibly thinner.
+            const float minR   = 0.5f * sliceM;
+            const float rAlong = std::max( puff.radius, minR );
+            const float rPerp  = puff.radius;
+
+            // The optical depth a ray collects is set by the ALONG-view extent,
+            // since that is the direction it travels. Padding that extent would
+            // thicken the puff, so divide it back out -- the puff looks the size
+            // it asked for and is as dense as it asked to be.
+            const float thin = puff.radius / rAlong;
+
+            // The view direction to THIS puff, precomputed. The shader's
+            // ellipsoid test needs it to split the offset into along-view and
+            // across-view parts, and it used to derive it per froxel with a
+            // normalize() -- a square root inside a loop that runs over every
+            // uploaded puff for each of ~900k cells. It is constant per puff per
+            // frame, and smokeShape.yzw were already spare, so it is computed
+            // here exactly once instead.
+            FVector3 vdir = puff.pos - eye;
+            const float vlen = vdir.Length();
+            // A puff centred exactly on the eye has no view direction. Any unit
+            // vector is as good as another there -- every offset is "across" it
+            // -- and leaving it unnormalized would send a NaN into the volume.
+            vdir = vlen > 1e-4f ? vdir / vlen : FVector3{ 0.f, 0.f, 1.f };
+
+            smoke_puffs[ i ]  = RgFloat4D{ puff.pos.X, puff.pos.Y, puff.pos.Z, rAlong };
+            smoke_shape[ i ]  = RgFloat4D{ rPerp, vdir.X, vdir.Y, vdir.Z };
+            smoke_albden[ i ] = RgFloat4D{
+                col.X, col.Y, col.Z,
+                puff.density * thin * dilute * sliceM / RT_VOLUME_CELL_COEFF * fade };
+            smoke_count++;
+        }
+    }
+
+    if( cvar::rt_smoke_debug )
+    {
+        // Every second, not every frame: the interesting failure is "nothing is
+        // happening", and a per-frame log of that scrolls the reason for it off
+        // the console. Reports what was SENT, so a live count with nothing on
+        // screen separates "no puffs spawned" from "puffs are not being drawn".
+        static int s_tick = 0;
+        if( ( ++s_tick % 35 ) == 0 )
+        {
+            const auto& vp = r_viewpoint.Pos;
+            const FVector3 eyeM{ float( vp.X ) * ONEGAMEUNIT_IN_METERS,
+                                 float( vp.Y ) * ONEGAMEUNIT_IN_METERS,
+                                 float( vp.Z ) * ONEGAMEUNIT_IN_METERS };
+
+            if( smoke_count > 0 )
+            {
+                const FVector3 p0{ smoke_puffs[ 0 ].data[ 0 ],
+                                   smoke_puffs[ 0 ].data[ 1 ],
+                                   smoke_puffs[ 0 ].data[ 2 ] };
+                // Distance from the eye matters more than the position: the froxel
+                // volume only spans volumeCameraNear..far ALONG THE VIEW, so a puff
+                // nearer than the near plane or past the far one is simply not in
+                // the grid, and would look exactly like "the shader ignored it".
+                Printf( "rt_smoke C/sent: %u live, %u sent (budget %d) | puff0 %.2f %.2f %.2f "
+                        "r=%.2fm density=%.1f | eye %.2f %.2f %.2f dist=%.2fm | "
+                        "far %.1fm slice %.3fm cells-across=%.2f | fog %s vol_type %d "
+                        "owns=%d illum=%d DEBUGMODE=%d\n",
+                        g_smokePuffCount,
+                        smoke_count,
+                        int{ cvar::rt_smoke_budget },
+                        p0.X, p0.Y, p0.Z,
+                        smoke_puffs[ 0 ].data[ 3 ],
+                        smoke_albden[ 0 ].data[ 3 ],
+                        eyeM.X, eyeM.Y, eyeM.Z,
+                        ( p0 - eyeM ).Length(),
+                        smoke_far,
+                        smoke_far / 64.f,
+                        2.f * smoke_puffs[ 0 ].data[ 3 ] / ( smoke_far / 64.f ),
+                        fog.on ? "on" : "off",
+                        int{ cvar::rt_volume_type },
+                        smoke_owns ? 1 : 0,
+                        bool{ cvar::rt_smoke_illum } ? 1 : 0,
+                        int{ cvar::rt_smoke_debug } );
+            }
+            else
+            {
+                Printf( "rt_smoke C/sent: 0 sent | live=%u rt_smoke=%d budget=%d "
+                        "DEBUGMODE=%d (live>0 with 0 sent means the packing gate "
+                        "rejected them)\n",
+                        g_smokePuffCount,
+                        int{ cvar::rt_smoke },
+                        int{ cvar::rt_smoke_budget },
+                        int{ cvar::rt_smoke_debug } );
+            }
+        }
+    }
+
+    auto smoke_params = RgDrawFrameSmokeParams{
+        .sType          = RG_STRUCTURE_TYPE_DRAW_FRAME_SMOKE_PARAMS,
+        .pNext          = &sky_params,
+        .puffCount      = smoke_count,
+        .pPuffs         = smoke_puffs,
+        .pAlbedoDensity = smoke_albden,
+        .pShape         = smoke_shape,
+        // Both are chosen PER FROXEL in RtVolumetric.rgen, against smoke density
+        // rather than against a per-frame flag, so neither can move a fog cell.
+        .lightNearFade  = std::max( 0.f, float{ cvar::rt_smoke_light_near } ),
+        .illumBlend     = std::clamp( float{ cvar::rt_smoke_illum_blend }, 0.f, 1.f ),
+        .allLights      = bool{ cvar::rt_smoke_illum },
+        .lightFarFade   = std::max( 0.f, float{ cvar::rt_smoke_light_far } ),
+        // 32, matching the clamp in RTGL's VulkanDevice.cpp -- the two have to
+        // agree or the engine silently asks for more than the shader will do.
+        .samplesPerCell = uint32_t( std::clamp( int{ cvar::rt_smoke_spp }, 1, 32 ) ),
+        .maxLight       = std::max( 0.f, float{ cvar::rt_smoke_maxlight } ),
+        .debugMode      = uint32_t( std::max( 0, int{ cvar::rt_smoke_debug } ) ),
+        // Stylization. Inside smoke_evalAt rather than a screen-space filter, so
+        // a frame with no puffs is untouched and smoke-fogsafe still holds.
+        .stylize        = std::clamp( float{ cvar::rt_smoke_stylize }, 0.f, 1.f ),
+        .stylizeSteps   = uint32_t( std::clamp( int{ cvar::rt_smoke_stylize_steps }, 1, 64 ) ),
+        .stylizeGrid    = std::max( 0.f, float{ cvar::rt_smoke_stylize_grid } ),
+        // SMOKE'S OWN unlit floor, per froxel. Note this is the same cvar that
+        // feeds ambientColor below -- but that path only fires when smoke OWNS
+        // the volume (no fog, rt_volume_type 0), which the shipping config
+        // never is. So for years of this feature rt_smoke_ambient did nothing
+        // at all, and smoke was visible only while a light was on it.
+        .selfAmbient    = std::max( 0.f, float{ cvar::rt_smoke_ambient } ),
+        .tintBias       = std::clamp( float{ cvar::rt_smoke_tint }, 0.f, 1.f ),
+        .absorb         = std::max( 0.f, float{ cvar::rt_smoke_absorb } ),
+    };
+
+    // LIGHT SHAFTS FROM ORDINARY LAMPS. The list was collected by the fixture
+    // walks above; this only says how it is to be scattered. Empty (and so free)
+    // whenever rt_volume_shafts is off or nothing qualified.
+    //
+    // Its own pNext struct rather than fields on the volumetric params, for the
+    // reason the smoke block is: the fog is shipped and tuned on nine maps, and
+    // a struct that does not change size cannot break it.
+    const std::vector< uint64_t >& shaft_ids = RT_ShaftLightsSelect();
+
+    // Doom64-RT: VOLUMETRIC CLOUDS (rt_vclouds.cpp). Always linked; enabled=0
+    // when the mode is off, which leaves RTGL1's sky passes exactly as they
+    // were.
+    RgDrawFrameVolumetricCloudParams vcloud_params{};
+    RT_VCloudsParams( &vcloud_params );
+    vcloud_params.pNext = &smoke_params;
+
+    auto shaft_params = RgDrawFrameLightShaftParams{
+        .sType           = RG_STRUCTURE_TYPE_DRAW_FRAME_LIGHT_SHAFT_PARAMS,
+        .pNext           = &vcloud_params,
+        .count           = uint32_t( shaft_ids.size() ),
+        .pLightUniqueIds = shaft_ids.empty() ? nullptr : shaft_ids.data(),
+        .multiplier      = std::max( 0.f, float{ cvar::rt_volume_shaft_mult } ),
+        // METRES, like every other position and radius crossing this boundary.
+        // Not map units -- see ONEGAMEUNIT_IN_METERS; a light placed in map
+        // units lands 32x out and reads as simply absent.
+        .nearFade    = std::max( 0.f, float{ cvar::rt_volume_shaft_nearfade } ),
+        .minRadiance = std::max( 0.f, float{ cvar::rt_volume_shaft_mincontrib } ),
+        .maxTraced   = uint32_t( std::clamp( int{ cvar::rt_volume_shaft_trace }, 1, 32 ) ),
+        // Below -1 is the "share rt_volume_lassymetry" sentinel, resolved on the
+        // RTGL1 side so the two cannot drift.
+        .asymmetry = float{ cvar::rt_volume_shaft_asym },
+        .debugMode = uint32_t( std::clamp( int{ cvar::rt_volume_shaft_debug }, 0, 3 ) ),
+        // The two knobs the "shafts do not reach" report needed: how much of the
+        // inverse-square falloff is given back, and how the per-froxel ray
+        // budget is decided. See rt_volume_shaft_falloff / _relcull.
+        .falloffCompensation =
+            std::clamp( float{ cvar::rt_volume_shaft_falloff }, 0.f, 2.f ),
+        .relativeCull = std::clamp( float{ cvar::rt_volume_shaft_relcull }, 0.f, 1.f ),
     };
 
     auto volumetrics_params = RgDrawFrameVolumetricParams{
         .sType                   = RG_STRUCTURE_TYPE_DRAW_FRAME_VOLUMETRIC_PARAMS,
-        .pNext                   = &sky_params,
-        .enable                  = cvar::rt_volume_type != 0,
-        .maxHistoryLength        = cvar::rt_volume_type == 1 ? cvar::rt_volume_history : 0.f,
-        .useSimpleDepthBased     = cvar::rt_volume_type == 2,
-        .volumetricFar           = cvar::rt_volume_far,
-        .ambientColor            = { cvar::rt_volume_ambient,
-                                     cvar::rt_volume_ambient,
-                                     cvar::rt_volume_ambient },
-        .scaterring              = cvar::rt_volume_scatter,
+        .pNext                   = &shaft_params,
+        .enable                  = fog.on || cvar::rt_volume_type != 0 || smoke_count > 0,
+        // Smoke-only frames drop the history: it is tuned for fog, which moves
+        // no faster than the player, and it smears a puff that does.
+        // THE SECOND TEMPORAL FILTER, and the one that made smoke stay bright
+        // after its muzzle flash had gone.
+        //
+        // The froxel's own blend (rt_smoke_illum_blend) decays in a handful of
+        // frames. THIS is a per-pixel accumulation on top of it, 8 frames deep
+        // and tuned for fog -- which moves no faster than the player. A muzzle
+        // flash lasts 2-3 frames, so the puff it lit goes on glowing through the
+        // whole window after the light is gone.
+        //
+        // The `smoke_owns ? 0` above was meant to prevent exactly that, and
+        // never fired: smoke_owns needs rt_volume_type 0 and the shipping pin is
+        // 1, the same dead gate that made rt_smoke_ambient a no-op. So the
+        // shortened history is chosen on SMOKE BEING LIVE instead.
+        //
+        // NOT on a fogged map. Shortening the window there would retune the fog
+        // every time the player pulled the trigger, which is the per-frame trap
+        // docs/rt-smoke.md section 5 exists to forbid. Fogged maps keep the
+        // fog's history and the smoke on them keeps the smear; that is the
+        // conservative half of the trade and it costs nine maps a little.
+        // rt_smoke_history is used DIRECTLY, not min()'d with rt_volume_history.
+        //
+        // The min was there because this knob was only ever meant to SHORTEN the
+        // window: the fog's 8 frames made a muzzle-lit puff smear, so smoke asked
+        // for 2. But it also silently capped the knob at 8 in the other direction,
+        // so "history 20" and "history 8" were the same setting and the cvar looked
+        // broken to anyone trying to use accumulation to denoise -- which is a real
+        // use for it, since the volume has no spatial denoiser worth the name.
+        // Shortening still works exactly as before; lengthening now does too, and
+        // the smear it buys back is the caller's choice to make.
+        .maxHistoryLength        = ( smoke_live && !fog.on )
+                                       ? float{ cvar::rt_smoke_history }
+                                   : ( fog.on || cvar::rt_volume_type == 1 )
+                                       ? float{ cvar::rt_volume_history }
+                                       : 0.f,
+        // A fogged map always takes the froxel path: the depth-based one cannot
+        // be lit, which is the whole point here. rt_volume_type 2 still selects
+        // it for an A/B (tools/ab-fog.cmd flat) because that arm turns rt_fog
+        // off first.
+        .useSimpleDepthBased     = !fog.on && cvar::rt_volume_type == 2,
+        // smoke_far is fog.far_m on a fogged map, so this is unchanged there.
+        // Smoke-only it is rt_smoke_far, which is a RESOLUTION knob: 64 slices
+        // over 14 m are 0.22 m thick and can resolve a puff, where the 30 m of
+        // rt_volume_far gives 0.47 m and a puff reads as one slab.
+        .volumetricFar           = smoke_far,
+        .ambientColor            = fog.on ? RgFloat3D{ fog.ambient, fog.ambient, fog.ambient }
+                                   : smoke_owns
+                                       ? RgFloat3D{ cvar::rt_smoke_ambient,
+                                                    cvar::rt_smoke_ambient,
+                                                    cvar::rt_smoke_ambient }
+                                       : RgFloat3D{ cvar::rt_volume_ambient,
+                                                    cvar::rt_volume_ambient,
+                                                    cvar::rt_volume_ambient },
+        // Zero base density is what makes smoke-only mode free of side effects:
+        // a cell with no puff in it stores vec4( 0 ) exactly as it does today,
+        // and the far slice past rt_smoke_far is empty rather than a wall.
+        .scaterring              = fog.on ? fog.density
+                                   : smoke_owns ? 0.f
+                                                : volume_dens,
         .assymetry               = cvar::rt_volume_lassymetry,
-        .useIlluminationVolume   = false,
+        .useIlluminationVolume   = cvar::rt_illum_volume && cvar::rt_volume_type != 0,
         .fallbackSourceColor     = { 0, 0, 0 },
         .fallbackSourceDirection = { 0, -1, 0 },
-        .lightMultiplier         = cvar::rt_volume_lintensity,
+        // On a CLOUD map (rt_clouds is off globally and the per-map presets
+        // turn it on), the moon's shafts take rt_clouds_volume_lintensity
+        // instead of the global: under a deck the haze scattered off the moon
+        // otherwise competes with the deck for the sky (asked for 2026-08-23).
+        // Not on a fire map, whose medium is already zero above.
+        .lightMultiplier         = fog.on ? std::max( 0.f, float{ cvar::rt_fog_lightmult } )
+                                   : ( bool{ cvar::rt_clouds } && !fire_sky &&
+                                       float{ cvar::rt_clouds_volume_lintensity } >= 0.f )
+                                       ? float{ cvar::rt_clouds_volume_lintensity }
+                                       : float{ cvar::rt_volume_lintensity },
         .allowTintUnderwater     = false,
         .underwaterColor         = {},
+        // The two RTGL1 additions this feature is built on. Both are no-ops off
+        // a fogged map: mediaColor { 1, 1, 1 } is the identity tint, and
+        // illuminateFromAllLights false leaves the stock single-light pass
+        // exactly as it was.
+        // FOG ONLY. Smoke wants the all-lights estimate too, but asking for it
+        // here would switch the ENTIRE volume off
+        // traceDirectIllumination_SpecificLight -- and that function is the only
+        // place the sun's sky-probe test lives, i.e. the only thing that makes a
+        // map's light shafts. Smoke asks per FROXEL instead, via
+        // RgDrawFrameSmokeParams::allLights.
+        .illuminateFromAllLights = fog.on && fog.illum,
+        .mediaColor              = fog.on ? RgFloat3D{ fog.r, fog.g, fog.b }
+                                          : RgFloat3D{ 1.f, 1.f, 1.f },
+        // Near and far are one medium with a ramp through it, not two fogs. See
+        // rt_fog_density_far -- the froxel slices are uniform in distance, so
+        // this costs one mix() per cell and nothing else.
+        .mediaColorFar           = fog.on ? RgFloat3D{ fog.rf, fog.gf, fog.bf }
+                                          : RgFloat3D{ 1.f, 1.f, 1.f },
+        // Same normalisation as .scaterring: the near and far ends are one
+        // medium, so they have to be in the same units or the ramp bends with
+        // the reach. And the smoke_owns case has to state its zero here too --
+        // near 0 with a non-zero far is a ramp from clear air into haze, which
+        // is the opposite of the "far slice is empty rather than a wall" that
+        // zero base density is for.
+        .farScattering           = fog.on ? fog.density_far
+                                   : smoke_owns ? 0.f
+                                                : volume_dens,
+        .densityCurve            = fog.on ? fog.curve : 1.f,
+        .occludeEmission = bool{ cvar::rt_volume_occlude_emis },
+        .ditherRadius  = std::max( 0.f, float{ cvar::rt_volume_dither } ),
+        // The DEPTH half, on its own leash. -sampleHemisphere() is one-sided in
+        // z, so this radius is a mean shortfall of 0.33 * radius froxels against
+        // a prefix-summed volume rather than a symmetric jitter -- it deletes the
+        // far end of every column instead of blurring it. See rt_volume_dither_z.
+        .ditherRadiusZ = std::max( 0.f, float{ cvar::rt_volume_dither_z } ),
+        .spatialBlur   = std::clamp( float{ cvar::rt_volume_blur }, 0.f, 1.f ),
+        .lightNearFade = fog.on ? std::max( 0.f, float{ cvar::rt_fog_light_near } ) : 0.f,
+        // THE FROXEL DEPTH GATE. Stops the volume lighting air the camera cannot
+        // see -- see rt_volume_depthgate, and docs/plan-light-shafts.md 4d for
+        // why this is not a visibility fix and why no per-light test could have
+        // worked. Applies to fogged maps too: the mechanism is the trilinear
+        // read of a prefix sum and it does not care which medium filled the
+        // cell.
+        .depthGate        = bool{ cvar::rt_volume_depthgate } ? 1.f : 0.f,
+        .depthGateBias    = std::max( 0.f, float{ cvar::rt_volume_depthgate_bias } ),
+        .depthGateFeather = std::max( 0.f, float{ cvar::rt_volume_depthgate_feather } ),
+        .depthGateTaps    = uint32_t( int{ cvar::rt_volume_depthgate_taps } >= 5 ? 5 : 1 ),
+        // THE UPSCALER BIAS MASK. The dark outline at every edge seen through a
+        // medium is the upscaler's, not the froxel grid's -- measured, see
+        // docs/rt-volumetric-edge-outlines.md -- and this is what tells DLSS and
+        // FSR2 where the medium's silhouettes are.
+        .volumeUpscaleBias      = std::clamp( float{ cvar::rt_volume_ubias }, 0.f, 1.f ),
+        .volumeUpscaleBiasEdge  = std::max( 0.001f, float{ cvar::rt_volume_ubias_edge } ),
+        .volumeUpscaleBiasFloor = std::clamp( float{ cvar::rt_volume_ubias_floor }, 0.f, 1.f ),
+        .volumeUpscaleBiasDebug = uint32_t( bool{ cvar::rt_volume_ubias_debug } ? 1 : 0 ),
+        // THE FIX, rather than the mitigation: move the composite past the
+        // upscaler. RTGL gates it off under Ray Reconstruction and frame
+        // generation by itself -- see rt_volume_postcomp.
+        .volumePostComp = uint32_t( bool{ cvar::rt_volume_postcomp } ? 1 : 0 ),
+        .volumeEdgeSoft     = std::max( 0.f, float{ cvar::rt_volume_edgesoft } ),
+        .volumeEdgeSoftEdge = std::max( 0.001f, float{ cvar::rt_volume_edgesoft_edge } ),
+        .volumeFp           = std::clamp( float{ cvar::rt_volume_fp }, 0.f, 2.f ),
+        .volumeReproj       = ( cvar::rt_volume_reproj ? 1u : 0u ),
+        .volumeSpriteShadow = ( cvar::rt_volume_spriteshadow ? 1u : 0u ),
+        .volumeGridHistory  = std::clamp( float{ cvar::rt_volume_taccum }, 0.f, 64.f ),
     };
 
     auto texture_params = RgDrawFrameTexturesParams{
@@ -3510,11 +3474,26 @@ void RTFrameBuffer::RT_DrawFrame()
         .pNext = &volumetrics_params,
         .dynamicSamplerFilter =
             cvar::rt_smoothtextures ? RG_SAMPLER_FILTER_LINEAR : RG_SAMPLER_FILTER_NEAREST,
+        .mipLodBiasOffset       = float( cvar::rt_mip_bias ),
         .normalMapStrength      = cvar::rt_normalmap_stren,
         .emissionMapBoost       = cvar::rt_emis_mapboost,
         .emissionMaxScreenColor = cvar::rt_emis_maxscrcolor,
         .minRoughness           = cvar::rt_refl_thresh,
         .heightMapDepth         = 0.02f * cvar::rt_heightmap_stren,
+        // Inverted on purpose: the cvar reads as "metals on", the API field as
+        // "strip them". rt_metallic 0 turns the whole hand-labelled metalness
+        // pass off without touching a single _orm.png.
+        .forceNonMetallic       = !cvar::rt_metallic,
+        .metallicMax            = cvar::rt_metallic_max,
+        .metallicRoughCut       = cvar::rt_metallic_roughcut,
+        .metallicRoughBand      = cvar::rt_metallic_roughband,
+        .spritePbr              = cvar::rt_sprite_pbr
+                                      ? std::clamp( float{ cvar::rt_sprite_pbr_mix }, 0.f, 1.f )
+                                      : 0.f,
+        .spriteMetallicMax      = cvar::rt_sprite_metallic_max,
+        .spriteRoughMin         = cvar::rt_sprite_rough_min,
+        .spriteNormalStrength   = cvar::rt_sprite_normal,
+        .worldPbr               = std::clamp( float{ cvar::rt_tex_pbr_mix }, 0.f, 1.f ),
     };
 
     float dirtscale = ( ( powerupflags & RT_POWERUP_FLAG_RADIATIONSUIT_BIT ) ||
@@ -3531,17 +3510,96 @@ void RTFrameBuffer::RT_DrawFrame()
         .lensDirtIntensity = cvar::rt_bloom_dirt ? dirtscale : 0.f,
     };
 
+    // GI path depth, and the shadow-ray depth it needs. A bounce vertex at
+    // index >= maxBounceShadows samples NO analytic lights (RaygenCommon.h
+    // isDirectIlluminationValid), so past rt_shadowrays a deeper bounce costs
+    // a ray and a full RIS pass to return emissives only. Indices are 0
+    // (primary) and 1..N (indirect vertices): lighting depth N needs N+1.
+    //
+    // This is a per-frame PARAM value. The cvar itself is never written --
+    // rt_shadowrays is archived and deliberately unpinned, and a startup
+    // re-apply of it once cost a day (rt_quality.cpp, tools/d64rt-pins.cfg).
+    // 0 is NOT a low value -- it means "light every vertex, cast no shadow
+    // rays" -- so it is preserved, never floored. And the floor is a no-op at
+    // depth 2, so the shipped configuration is untouched.
+    const uint32_t giDepth  = uint32_t( std::clamp( int( cvar::rt_gi_bounces ), 1, 4 ) );
+    uint32_t       shadowsN = safe_uint( *cvar::rt_shadowrays );
+    if( cvar::rt_gi_bounce_shadows && giDepth > 2u && shadowsN != 0u )
+    {
+        shadowsN = std::max( shadowsN, giDepth + 1u );
+    }
+
     auto illum_params = RgDrawFrameIlluminationParams{
         .sType                              = RG_STRUCTURE_TYPE_DRAW_FRAME_ILLUMINATION_PARAMS,
         .pNext                              = &bloom_params,
-        .maxBounceShadows                   = safe_uint( *cvar::rt_shadowrays ),
-        .enableSecondBounceForIndirect      = true,
+        .maxBounceShadows                   = shadowsN,
+        .indirectBounces                    = giDepth,
+        .indirectLegacyBounceWeight         = static_cast< RgBool32 >( bool( cvar::rt_gi_bounce_legacy ) ),
         .cellWorldSize                      = 2.0f,
-        .directDiffuseSensitivityToChange   = 1.0f,
-        .indirectDiffuseSensitivityToChange = 0.75f,
-        .specularSensitivityToChange        = 1.0f,
+        .directDiffuseSensitivityToChange   = std::clamp( float( cvar::rt_illum_sens_direct ), 0.f, 1.f ),
+        .indirectDiffuseSensitivityToChange = std::clamp( float( cvar::rt_illum_sens_indirect ), 0.f, 1.f ),
+        .specularSensitivityToChange        = std::clamp( float( cvar::rt_illum_sens_spec ), 0.f, 1.f ),
         .polygonalLightSpotlightFactor      = 2.0f,
         .lightUniqueIdIgnoreFirstPersonViewerShadows = &FlashlightLightId,
+        .enableRrTemporalPrefilter          = static_cast< RgBool32 >( bool( cvar::rt_rr_temporal ) ),
+        .enableRrDisocclusionMask           = static_cast< RgBool32 >( bool( cvar::rt_rr_disocc ) ),
+        .rrDisocclusionThreshold            = std::max( float( cvar::rt_rr_disocc_ratio ), 1.0f ),
+        .rrDisocclusionMinDelta             = std::max( float( cvar::rt_rr_disocc_mindelta ), 0.0f ),
+        .rrDisocclusionShowMask             = static_cast< RgBool32 >( bool( cvar::rt_rr_disocc_show ) ),
+        .rrFireflyThreshold                 = std::max( float( cvar::rt_rr_firefly ), 0.0f ),
+        .rrFireflyMinLum                    = std::max( float( cvar::rt_rr_firefly_minlum ), 0.0f ),
+        .restirBlueNoise                    = static_cast< RgBool32 >( bool( cvar::rt_restir_bluenoise ) ),
+        .shadowSamples                      = uint32_t( std::clamp( int( cvar::rt_shadow_samples ), 1, 8 ) ),
+        .debugRestirM                       = uint32_t( std::clamp( int( cvar::rt_debug_restir_m ), 0, 2 ) ),
+        .debugVisibility                    = uint32_t( std::clamp( int( cvar::rt_debug_visibility ), 0, 2 ) ),
+        .debugShowFlags                     = uint32_t( std::max( 0, int( cvar::rt_debug_show ) ) ),
+        .restirTemporalJitter               = std::clamp( float( cvar::rt_restir_tjitter ), 0.0f, 8.0f ),
+        .rrSpecularHitDistance              = static_cast< RgBool32 >( bool( cvar::rt_rr_spechitdist ) ),
+        .directSamples                      = uint32_t( std::clamp( int( cvar::rt_spp_direct ), 1, 8 ) ),
+        .indirectSamples                    = uint32_t( std::clamp( int( cvar::rt_spp_indirect ), 1, 8 ) ),
+        .restirInitialSamples               = uint32_t( std::clamp( int( cvar::rt_restir_initial ), 1, 64 ) ),
+        .restirSpatialSamples               = uint32_t( std::clamp( int( cvar::rt_restir_spatial ), 0, 16 ) ),
+        .restirSpatialRadius                = std::clamp( float( cvar::rt_restir_spatial_radius ), 1.0f, 64.0f ),
+        // RR-scoped decorrelation: ReSTIR's temporal reuse keeps a reservoir
+        // winner for up to mcap frames, so a bad shadowed sample persists as a
+        // STABLE dark dot -- structure a temporal denoiser preserves as
+        // detail. A-SVGF's spatial atrous blurs those away; DLSS-RR has no
+        // equivalent and its guide (S3.5) asks for minimally correlated
+        // samples outright. Toggling the flashlight reseeds the reservoirs,
+        // which is why the dot PATTERN visibly switched with it. Override only
+        // on frames where RR actually runs (g_rr_dbg_rrRequested is this
+        // frame's RT_UpscaleCvarsToRtgl decision); -1 disables the override.
+        .restirTemporalMCap                 = uint32_t( std::clamp(
+            ( g_rr_dbg_rrRequested && int( cvar::rt_rr_restir_mcap ) >= 0 )
+                                ? int( cvar::rt_rr_restir_mcap )
+                                : int( cvar::rt_restir_mcap ),
+            1,
+            64 ) ),
+        .rrGuideMin                         = std::clamp( float( cvar::rt_rr_guide_min ), 0.0f, 1.0f ),
+        .rrGuideMode                        = uint32_t( std::clamp( int( cvar::rt_rr_guide_mode ), 0, 2 ) ),
+        .restirIndirAntilag                 = static_cast< RgBool32 >( bool( cvar::rt_restir_indir_antilag ) ),
+        .rrPreExposure                      = static_cast< RgBool32 >( bool( cvar::rt_rr_preexposure ) ),
+        .rrPreExposureDebug                 = static_cast< RgBool32 >( bool( cvar::rt_rr_preexp_debug ) ),
+        .rrExposureTexture                  = static_cast< RgBool32 >( bool( cvar::rt_rr_exptex ) ),
+        .rrTransparencyLayer                = static_cast< RgBool32 >( bool( cvar::rt_rr_translayer ) ),
+        .nrdDenoiser                        = static_cast< RgBool32 >( bool( cvar::rt_nrd ) ),
+        .rrGlowPre                          = uint32_t( std::clamp( int( cvar::rt_rr_glowpre ), 0, 2 ) ),
+        .rrGlowScale                        = std::max( 0.0f, float( cvar::rt_rr_glowscale ) ),
+        .rrDemod                            = static_cast< RgBool32 >( bool( cvar::rt_rr_demod ) ),
+        .rrDemodFilter                      = uint32_t( std::clamp( int( cvar::rt_rr_demod_filter ), 0, 2 ) ),
+        .nrdValidation                      = static_cast< RgBool32 >( bool( cvar::rt_nrd_validation ) ),
+        .nrdMaxAccumFrames                  = uint32_t( std::max( 0, int( cvar::rt_nrd_maxaccum ) ) ),
+        .nrdFastAccumFrames                 = uint32_t( std::max( 0, int( cvar::rt_nrd_fastaccum ) ) ),
+        .nrdAtrousIterations                = uint32_t( std::max( 0, int( cvar::rt_nrd_atrous ) ) ),
+        .nrdPrepassDiffuse                  = std::max( 0.0f, float( cvar::rt_nrd_prepass_diff ) ),
+        .nrdPrepassSpecular                 = std::max( 0.0f, float( cvar::rt_nrd_prepass_spec ) ),
+        .nrdPhiLuminance                    = std::max( 0.0f, float( cvar::rt_nrd_philum ) ),
+        .nrdMinHitDistWeight                = std::max( 0.0f, float( cvar::rt_nrd_minhitdist ) ),
+        .nrdAntiFirefly                     = static_cast< RgBool32 >( bool( cvar::rt_nrd_antifirefly ) ),
+        .svgfFp                             = uint32_t( std::clamp( int( cvar::rt_svgf_fp ), 0, 2 ) ),
+        .svgfFpGrad                         = static_cast< RgBool32 >( bool( cvar::rt_svgf_fp_grad ) ),
+        .svgfIndirMaxHist                   = std::clamp( float( cvar::rt_svgf_indir_maxhist ), 0.f, 256.f ),
+        .svgfIndirAntilag                   = static_cast< RgBool32 >( bool( cvar::rt_svgf_indir_antilag ) ),
     };
 
     auto ef_wipe = RgPostEffectWipe{
@@ -3703,15 +3761,111 @@ void RTFrameBuffer::RT_DrawFrame()
         .pDither               = &ef_dither,
     };
 
+    // DLSS-RR ONLY: flush temporal history this frame if any transient-light
+    // source flagged an abrupt cut (flashlight on/off, a dynlight appearing/
+    // disappearing, or a fresh level load -- see g_rt_lightcut's setters) or a
+    // diagnostic cvar asked for it. Rate-limited so rapid triggers (e.g. quick
+    // flashlight double-tap) don't chain resets back-to-back.
+    //
+    // SCOPED TO RR because the flush exists to paper over what DLSS-RR lacks:
+    // it has no lighting-change handling of its own, so transient lights
+    // linger in its history for seconds. A-SVGF (gradient antilag) and
+    // NRD/ReLAX (fast-history clamping) both handle lighting changes BY
+    // DESIGN -- and drawInfo.resetHistory reaches every consumer, so with the
+    // NRD lane it was translating each flashlight toggle into a full ReLAX
+    // CLEAR_AND_RESTART: the whole frame visibly re-converged from 1 spp on
+    // every toggle, while plain A-SVGF (which ignores the flag) was clean.
+    // Reported from play 2026-08-17 night; this gate is the fix.
+    // rt_rr_reset_now below stays unconditional -- an explicit diagnostic
+    // flush must work on any path.
+    const bool rrHistoryFlushApplies = g_rr_dbg_rrRequested;
+
+    bool wantResetHistory = bool{ cvar::rt_rr_reset_hold } && rrHistoryFlushApplies;
+
+    // rt_rr_reset_debug tallies: how many flushes actually reached NGX this
+    // second, and how many the rate limit swallowed. A trigger that over-fires
+    // shows up as a fired count pinned at ~1000/rt_rr_reset_min_ms per second
+    // with a large suppressed count behind it.
+    static uint32_t s_rrFired      = 0;
+    static uint32_t s_rrSuppressed = 0;
+    static double   s_rrTallyAt    = 0.0;
+
+    if( g_rt_lightcut )
+    {
+        g_rt_lightcut = false;
+        if( rrHistoryFlushApplies &&
+            curtime - g_rt_lastresetat >= double( cvar::rt_rr_reset_min_ms ) / 1000.0 )
+        {
+            wantResetHistory = true;
+            g_rt_lastresetat = curtime;
+
+            if( cvar::rt_rr_reset_debug )
+            {
+                ++s_rrFired;
+                Printf( "rt_rr_reset: FLUSH (cause: %s)\n", g_rt_lightcut_why );
+            }
+        }
+        else if( cvar::rt_rr_reset_debug )
+        {
+            ++s_rrSuppressed;
+        }
+    }
+
+    if( cvar::rt_rr_reset_debug )
+    {
+        if( curtime - s_rrTallyAt >= 1.0 )
+        {
+            if( s_rrFired || s_rrSuppressed )
+            {
+                Printf( "rt_rr_reset: last second — %u flush(es), %u suppressed by "
+                        "rt_rr_reset_min_ms\n",
+                        s_rrFired,
+                        s_rrSuppressed );
+            }
+            s_rrFired      = 0;
+            s_rrSuppressed = 0;
+            s_rrTallyAt    = curtime;
+        }
+    }
+
+    if( bool{ cvar::rt_rr_reset_now } )
+    {
+        cvar::rt_rr_reset_now = false;
+        wantResetHistory      = true;
+        g_rt_lastresetat      = curtime;
+    }
+
     auto info = RgDrawFrameInfo{
         .sType            = RG_STRUCTURE_TYPE_DRAW_FRAME_INFO,
         .pNext            = &post_params,
         .rayLength        = GetZFar() * ONEGAMEUNIT_IN_METERS,
         .presentPrevFrame = false,
+        .resetHistory     = static_cast< RgBool32 >( wantResetHistory ),
         .currentTime      = curtime,
     };
 
+    // Time probe, behind the flow debug cvar: the flow-map investigation found
+    // globalUniform.time FROZEN in the raygen shaders while everything RTGL
+    // does between info.currentTime and gu->time reads clean. This prints what
+    // gzdoom actually hands over, once a second, so "gzdoom sends a constant"
+    // and "RTGL loses it" stop being the same symptom.
+    if( bool{ cvar::rt_blood_flow_debug } )
+    {
+        static double s_lastTimeProbe = -1.0;
+        if( curtime - s_lastTimeProbe >= 1.0 || curtime < s_lastTimeProbe )
+        {
+            s_lastTimeProbe = curtime;
+            Printf( "RT time probe: curtime %.3f\n", curtime );
+        }
+    }
+
+    RTDrawFrame.Clock();
     RgResult r = rt.rgDrawFrame( &info );
+    RTDrawFrame.Unclock();
+
+    // After the accounting is complete for this frame, and only if
+    // rt_stat_every asked for it.
+    RT_StatsPeriodicDump();
     RG_CHECK( r );
 
     if( g_cpu_latency_get )
@@ -3730,12 +3884,12 @@ void RTFrameBuffer::RT_DrawFrame()
 //
 //
 
-bool RTRenderState::IsPerspectiveMatrix( const float* m )
+bool rtx::RTRenderState::IsPerspectiveMatrix( const float* m )
 {
     return std::abs( m[ 15 ] ) < std::numeric_limits< float >::epsilon();
 }
 
-bool RTRenderState::IsLikeIdentity( const float* m )
+bool rtx::RTRenderState::IsLikeIdentity( const float* m )
 {
     auto areSimilar = []( float a, float b ) {
         return std::abs( a - b ) < 0.0000001f;
@@ -3752,7 +3906,7 @@ bool RTRenderState::IsLikeIdentity( const float* m )
     }
     return true;
 }
-bool RTRenderState::IsLikeIdentity( const double* m )
+bool rtx::RTRenderState::IsLikeIdentity( const double* m )
 {
     auto areSimilar = []( double a, double b ) {
         return std::abs( a - b ) < 0.0000001;
@@ -3827,1071 +3981,6 @@ void RT_ForceCamera( const FVector3 position, const DRotator& rotation, float fo
     assert( r == RG_RESULT_SUCCESS );
 }
 
-// A hack to access special+tag by a linenum
-extern std::vector< std::pair< int, int > > rt_linesToSpecialAndTag;
-
-extern auto RT_GetStairsSectors( int tag, line_t* line ) -> std::vector< int >;
-
-namespace
-{
-
-std::unordered_set< int > g_tagsSafeToIgnore{};
-std::unordered_set< int > g_stairsSectors{};
-
-void RT_CacheTagsAndSpecials()
-{
-    if( !primaryLevel )
-    {
-        g_tagsSafeToIgnore.clear();
-        g_stairsSectors.clear();
-    }
-
-    assert( rt_linesToSpecialAndTag.size() == primaryLevel->lines.size() );
-
-    // 1 tag can be referenced by N specials
-    // this is the mapping from tag to its list of specials
-    std::unordered_map< int, std::unordered_set< int > > tagToSpecial{};
-    for( const auto& [ special, tag ] : rt_linesToSpecialAndTag )
-    {
-        // tag < 0 -- ignored
-        // tag = 0 -- has different behavior
-        if( tag > 0 )
-        {
-            tagToSpecial[ tag ].emplace( special );
-        }
-    }
-
-    // specials that do not move the geometry, so we can export it
-    auto l_isSafeToIgnoreSpecial = []( int spec ) {
-        switch( spec )
-        {
-            case Teleport:
-            case Teleport_NoStop:
-            case Teleport_NoFog:
-            case Light_RaiseByValue:
-            case Light_LowerByValue:
-            case Light_ChangeToValue:
-            case Light_Stop:
-            case Light_MinNeighbor:
-            case Light_MaxNeighbor:
-            case Light_StrobeDoom: return true;
-            default: return false;
-        }
-    };
-
-    // make a list 
-    std::unordered_set< int > tagsSafeToIgnore{};
-    for( const auto& [ tag, specials ] : tagToSpecial )
-    {
-        // if no specials on a tag, it's safe
-        if( specials.empty() )
-        {
-            assert( !tagsSafeToIgnore.contains( tag ) );
-            tagsSafeToIgnore.emplace( tag );
-            continue;
-        }
-
-        // if only one special on this tag
-        if( specials.size() == 1 )
-        {
-            // and it's a safe special
-            int spec = *specials.begin();
-            if( l_isSafeToIgnoreSpecial( spec ) )
-            {
-                assert( !tagsSafeToIgnore.contains( tag ) );
-                tagsSafeToIgnore.emplace( tag );
-                continue;
-            }
-        }
-
-        // surely, we can expand to specials.size() >= 2 (e.g. 1 tag is used for Teleport and Light_Stop => we can ignore),
-        // but let's play safely for now..
-    }
-
-    g_tagsSafeToIgnore = std::move( tagsSafeToIgnore );
-
-
-    assert( g_stairsSectors.empty() );
-    for( uint32_t i = 0; i < rt_linesToSpecialAndTag.size(); i++ )
-    {
-        const auto& [ special, tag ] = rt_linesToSpecialAndTag[ i ];
-
-        const auto sectornums = RT_GetStairsSectors( tag, &primaryLevel->lines[ i ] );
-        g_stairsSectors.insert( sectornums.begin(), sectornums.end() );
-    }
-}
-
-
-// NOTE: only linedef->special, and not sector->special, as it has only light change effects,
-// sector that move has tag or one of its lines marked as lift/door/etc (linedef->special)
-
-
-// If some line specials have tag==0,
-// then line's backsector is a target of the special's action
-bool IsTaggedByTag0( const line_t* linedef, const sector_t* target )
-{
-    if( !linedef || !primaryLevel )
-    {
-        return false;
-    }
-
-    // only backsectors
-    if( linedef->backsector != target )
-    {
-        return false;
-    }
-
-    // tag == 0
-    if( !primaryLevel->tagManager.RT_LineHasZeroTag( linedef ) )
-    {
-        return false;
-    }
-
-    switch( linedef->special )
-    {
-        // case ACS_Execute:
-        // case ACS_ExecuteAlways:
-        // case ACS_ExecuteWithResult:
-        // case ACS_LockedExecute:
-        // case ACS_LockedExecuteDoor:
-        // case ACS_Suspend:
-        // case ACS_Terminate:
-        // case Autosave:
-        case Ceiling_CrushAndRaise:
-        case Ceiling_CrushAndRaiseA:
-        case Ceiling_CrushAndRaiseDist:
-        case Ceiling_CrushAndRaiseSilentA:
-        case Ceiling_CrushAndRaiseSilentDist:
-        case Ceiling_CrushRaiseAndStay:
-        case Ceiling_CrushRaiseAndStayA:
-        case Ceiling_CrushRaiseAndStaySilA:
-        case Ceiling_CrushStop:
-        case Ceiling_LowerAndCrush:
-        case Ceiling_LowerAndCrushDist:
-        case Ceiling_LowerByTexture:
-        case Ceiling_LowerByValue:
-        case Ceiling_LowerByValueTimes8:
-        case Ceiling_LowerInstant:
-        case Ceiling_LowerToFloor:
-        case Ceiling_LowerToHighestFloor:
-        case Ceiling_LowerToLowest:
-        case Ceiling_LowerToNearest:
-        case Ceiling_MoveToValue:
-        case Ceiling_MoveToValueAndCrush:
-        case Ceiling_MoveToValueTimes8:
-        case Ceiling_RaiseByTexture:
-        case Ceiling_RaiseByValue:
-        case Ceiling_RaiseByValueTimes8:
-        case Ceiling_RaiseInstant:
-        case Ceiling_RaiseToHighest:
-        case Ceiling_RaiseToHighestFloor:
-        case Ceiling_RaiseToLowest:
-        case Ceiling_RaiseToNearest:
-        case Ceiling_Stop:
-        case Ceiling_ToFloorInstant:
-        case Ceiling_ToHighestInstant:
-        case Ceiling_Waggle:
-        // case ChangeCamera:
-        // case ChangeSkill:
-        // case ClearForceField:
-        // case DamageThing:
-        case Door_Animated:
-        case Door_AnimatedClose:
-        case Door_Close:
-        case Door_CloseWaitOpen:
-        case Door_LockedRaise:
-        case Door_Open:
-        case Door_Raise:
-        case Door_WaitClose:
-        case Door_WaitRaise:
-        case Elevator_LowerToNearest:
-        case Elevator_MoveToFloor:
-        case Elevator_RaiseToNearest:
-        // case Exit_Normal:
-        // case Exit_Secret:
-        // case ExtraFloor_LightOnly:
-        case Floor_CrushStop:
-        case Floor_Donut:
-        case Floor_LowerByTexture:
-        case Floor_LowerByValue:
-        case Floor_LowerByValueTimes8:
-        case Floor_LowerInstant:
-        case Floor_LowerToHighest:
-        case Floor_LowerToHighestEE:
-        case Floor_LowerToLowest:
-        case Floor_LowerToLowestCeiling:
-        case Floor_LowerToLowestTxTy:
-        case Floor_LowerToNearest:
-        case Floor_MoveToValue:
-        case Floor_MoveToValueAndCrush:
-        case Floor_MoveToValueTimes8:
-        case Floor_RaiseAndCrush:
-        case Floor_RaiseAndCrushDoom:
-        case Floor_RaiseByTexture:
-        case Floor_RaiseByValue:
-        case Floor_RaiseByValueTimes8:
-        case Floor_RaiseByValueTxTy:
-        case Floor_RaiseInstant:
-        case Floor_RaiseToCeiling:
-        case Floor_RaiseToHighest:
-        case Floor_RaiseToLowest:
-        case Floor_RaiseToLowestCeiling:
-        case Floor_RaiseToNearest:
-        case Floor_Stop:
-        case Floor_ToCeilingInstant:
-        case Floor_TransferNumeric:
-        case Floor_TransferTrigger:
-        case Floor_Waggle:
-        case FloorAndCeiling_LowerByValue:
-        case FloorAndCeiling_LowerRaise:
-        case FloorAndCeiling_RaiseByValue:
-        // case ForceField:
-        // case FS_Execute:
-        case Generic_Ceiling:
-        case Generic_Crusher:
-        case Generic_Crusher2:
-        case Generic_Door:
-        case Generic_Floor:
-        case Generic_Lift:
-        case Generic_Stairs:
-        // case GlassBreak:
-        // case HealThing:
-        // case Light_ChangeToValue:
-        // case Light_Fade:
-        // case Light_Flicker:
-        // case Light_ForceLightning:
-        // case Light_Glow:
-        // case Light_LowerByValue:
-        // case Light_MaxNeighbor:
-        // case Light_MinNeighbor:
-        // case Light_RaiseByValue:
-        // case Light_Stop:
-        // case Light_Strobe:
-        // case Light_StrobeDoom:
-        // case Line_AlignCeiling:
-        // case Line_AlignFloor:
-        // case Line_Horizon:
-        // case Line_Mirror:
-        // case Line_QuickPortal:
-        // case Line_SetAutomapFlags:
-        // case Line_SetAutomapStyle:
-        // case Line_SetBlocking:
-        // case Line_SetHealth:
-        // case Line_SetIdentification:
-        // case Line_SetPortal:
-        // case Line_SetPortalTarget:
-        // case Line_SetTextureOffset:
-        // case Line_SetTextureScale:
-        // case NoiseAlert:
-        case Pillar_Build:
-        case Pillar_BuildAndCrush:
-        case Pillar_Open:
-        // case Plane_Align:
-        // case Plane_Copy:
-        case Plat_DownByValue:
-        case Plat_DownWaitUpStay:
-        case Plat_DownWaitUpStayLip:
-        case Plat_PerpetualRaise:
-        case Plat_PerpetualRaiseLip:
-        case Plat_RaiseAndStayTx0:
-        case Plat_Stop:
-        case Plat_ToggleCeiling:
-        case Plat_UpByValue:
-        case Plat_UpByValueStayTx:
-        case Plat_UpNearestWaitDownStay:
-        case Plat_UpWaitDownStay:
-        // case PointPush_SetForce:
-        // case Polyobj_DoorSlide:
-        // case Polyobj_DoorSwing:
-        // case Polyobj_ExplicitLine:
-        // case Polyobj_Move:
-        // case Polyobj_MoveTimes8:
-        // case Polyobj_MoveTo:
-        // case Polyobj_MoveToSpot:
-        // case Polyobj_OR_Move:
-        // case Polyobj_OR_MoveTimes8:
-        // case Polyobj_OR_MoveTo:
-        // case Polyobj_OR_MoveToSpot:
-        // case Polyobj_OR_RotateLeft:
-        // case Polyobj_OR_RotateRight:
-        // case Polyobj_RotateLeft:
-        // case Polyobj_RotateRight:
-        // case Polyobj_StartLine:
-        // case Polyobj_Stop:
-        // case Polyobj_StopSound:
-        // case Radius_Quake:
-        // case Scroll_Ceiling:
-        // case Scroll_Floor:
-        // case Scroll_Texture_Both:
-        // case Scroll_Texture_Down:
-        // case Scroll_Texture_Left:
-        // case Scroll_Texture_Model:
-        // case Scroll_Texture_Offsets:
-        // case Scroll_Texture_Right:
-        // case Scroll_Texture_Up:
-        // case Scroll_Wall:
-        // case Sector_Attach3dMidtex:
-        // case Sector_ChangeFlags:
-        // case Sector_ChangeSound:
-        // case Sector_CopyScroller:
-        // case Sector_Set3DFloor:
-        // case Sector_SetCeilingGlow:
-        // case Sector_SetCeilingPanning:
-        // case Sector_SetCeilingScale:
-        // case Sector_SetCeilingScale2:
-        // case Sector_SetColor:
-        // case Sector_SetContents:
-        // case Sector_SetCurrent:
-        // case Sector_SetDamage:
-        // case Sector_SetFade:
-        // case Sector_SetFloorGlow:
-        // case Sector_SetFloorPanning:
-        // case Sector_SetFloorScale:
-        // case Sector_SetFloorScale2:
-        // case Sector_SetFriction:
-        // case Sector_SetGravity:
-        // case Sector_SetHealth:
-        // case Sector_SetLink:
-        // case Sector_SetPlaneReflection:
-        // case Sector_SetPortal:
-        // case Sector_SetRotation:
-        // case Sector_SetTranslucent:
-        // case Sector_SetWind:
-        // case SendToCommunicator:
-        // case SetGlobalFogParameter:
-        // case SetPlayerProperty:
-        case Stairs_BuildDown:
-        case Stairs_BuildDownDoom:
-        case Stairs_BuildDownDoomSync:
-        case Stairs_BuildDownSync:
-        case Stairs_BuildUp:
-        case Stairs_BuildUpDoom:
-        case Stairs_BuildUpDoomCrush:
-        case Stairs_BuildUpDoomSync:
-        case Stairs_BuildUpSync:
-        // case StartConversation:
-        // case Static_Init:
-        // case Teleport:
-        // case Teleport_EndGame:
-        // case Teleport_Line:
-        // case Teleport_NewMap:
-        // case Teleport_NoFog:
-        // case Teleport_NoStop:
-        // case Teleport_ZombieChanger:
-        // case TeleportGroup:
-        // case TeleportInSector:
-        // case TeleportOther:
-        // case Thing_Activate:
-        // case Thing_ChangeTID:
-        // case Thing_Damage:
-        // case Thing_Deactivate:
-        // case Thing_Destroy:
-        // case Thing_Hate:
-        // case Thing_Move:
-        // case Thing_Projectile:
-        // case Thing_ProjectileAimed:
-        // case Thing_ProjectileGravity:
-        // case Thing_ProjectileIntercept:
-        // case Thing_Raise:
-        // case Thing_Remove:
-        // case Thing_SetConversation:
-        // case Thing_SetGoal:
-        // case Thing_SetSpecial:
-        // case Thing_SetTranslation:
-        // case Thing_Spawn:
-        // case Thing_SpawnFacing:
-        // case Thing_SpawnNoFog:
-        // case Thing_Stop:
-        // case ThrustThing:
-        // case ThrustThingZ:
-        case Transfer_CeilingLight:
-        case Transfer_FloorLight:
-        case Transfer_Heights:
-        case Transfer_WallLight:
-            // case TranslucentLine:
-            // case UsePuzzleItem:
-            return true;
-        default: return false;
-    }
-}
-
-bool RT_IsSectorMovable( const sector_t* sector )
-{
-    if( !sector )
-    {
-        return false;
-    }
-
-    auto isTaggedExplicitly = []( const sector_t& s ) {
-        if( !primaryLevel )
-        {
-            return false;
-        }
-
-        if( g_stairsSectors.contains( s.Index() ) )
-        {
-            return true;
-        }
-
-        auto l_safeToIgnoreTag = [ & ]( int tag ) {
-            return g_tagsSafeToIgnore.contains( tag );
-        };
-
-        // if there's at least one NON-safe tag on this sector, it's tagged
-        const auto sectorTags = primaryLevel->tagManager.RT_GetAllSectorTags( &s );
-        return !std::ranges::all_of( sectorTags, l_safeToIgnoreTag );
-    };
-
-    auto isTaggedImplicitly = []( const sector_t& s ) {
-        for( const line_t* l : s.Lines )
-        {
-            if( IsTaggedByTag0( l, &s ) )
-            {
-                return true;
-            }
-        }
-        return false;
-    };
-
-    return isTaggedExplicitly( *sector ) || isTaggedImplicitly( *sector );
-}
-
-bool RT_IsTexAnimated( int texnum, const std::vector< bool >& animatedTexnums )
-{
-    if( texnum < 0 || static_cast< uint32_t >( texnum ) >= animatedTexnums.size() )
-    {
-        assert( 0 );
-        return false;
-    }
-    return animatedTexnums[ texnum ];
-}
-
-bool RT_IsSectorExportable( const sector_t*            sector,
-                            bool                       ceiling,
-                            const std::vector< bool >& animatedTexnums )
-{
-    if( !sector )
-    {
-        assert( 0 );
-        return false;
-    }
-
-    // e.g. nukage, lava
-    bool isAnimated = RT_IsTexAnimated(
-        sector->GetTexture( ceiling ? sector_t::ceiling : sector_t::floor ).GetIndex(),
-        animatedTexnums );
-
-    return !isAnimated && !RT_IsSectorMovable( sector );
-}
-
-bool RT_IsWallExportable( const seg_t* seg, const std::vector< bool >& animatedTexnums )
-{
-    if( !seg )
-    {
-        assert( 0 );
-        return false;
-    }
-
-    if( seg->sidedef && ( seg->sidedef->Flags & WALLF_POLYOBJ ) )
-    {
-        return false;
-    }
-
-    // e.g. switches
-    auto isAnimated = [ &animatedTexnums ]( const side_t* side ) {
-        if( side )
-        {
-            return RT_IsTexAnimated( side->GetTexture( 0 ).GetIndex(), animatedTexnums ) ||
-                   RT_IsTexAnimated( side->GetTexture( 1 ).GetIndex(), animatedTexnums ) ||
-                   RT_IsTexAnimated( side->GetTexture( 2 ).GetIndex(), animatedTexnums );
-        }
-        return false;
-    };
-
-    auto isAdjacentSectorMovable = []( const seg_t& s ) {
-        if( s.linedef )
-        {
-            return RT_IsSectorMovable( s.linedef->backsector ) ||
-                   RT_IsSectorMovable( s.linedef->frontsector );
-        }
-        return true;
-    };
-
-    return !isAnimated( seg->sidedef ) && !isAdjacentSectorMovable( *seg );
-}
-
-enum
-{
-    RT_WALL_PEGGED_TOP    = 1,
-    RT_WALL_PEGGED_BOTTOM = 2,
-};
-
-// Pegged texture moves with a Sector that moves
-uint8_t RT_WallPeggedFlags( const seg_t* seg )
-{
-    if( !seg || !seg->linedef )
-    {
-        return false;
-    }
-
-    // if double sided
-    if( seg->backsector )
-    {
-        int fs = RT_WALL_PEGGED_TOP | RT_WALL_PEGGED_BOTTOM;
-
-        if( seg->linedef->flags & ML_DONTPEGTOP )
-        {
-            fs = ( fs & ~( RT_WALL_PEGGED_TOP ) );
-        }
-
-        if( seg->linedef->flags & ML_DONTPEGBOTTOM )
-        {
-            fs = ( fs & ~( RT_WALL_PEGGED_BOTTOM ) );
-        }
-        
-        return uint8_t( fs );
-    }
-    else
-    {
-        // one sided always pegged
-        return RT_WALL_PEGGED_TOP | RT_WALL_PEGGED_BOTTOM;
-    }
-}
-
-auto rt_sectorCeilingExportable = std::vector< bool >{};
-auto rt_sectorFloorExportable   = std::vector< bool >{};
-auto rt_wallExportable          = std::vector< bool >{};
-auto rt_wallPegged              = std::vector< uint8_t >{};
-
-} // anonymous namespace
-
-void RT_BakeExportables( const std::vector< bool >& animatedTexnums )
-{
-    rt_sectorCeilingExportable.clear();
-    rt_sectorFloorExportable.clear();
-    rt_wallExportable.clear();
-    rt_wallPegged.clear();
-    g_tagsSafeToIgnore.clear();
-    g_stairsSectors.clear();
-
-    if( !primaryLevel )
-    {
-        return;
-    }
-
-    RT_CacheTagsAndSpecials();
-
-    rt_sectorCeilingExportable.resize( primaryLevel->sectors.Size(), false );
-    rt_sectorFloorExportable.resize( primaryLevel->sectors.Size(), false );
-    for( uint32_t i = 0; i < primaryLevel->sectors.Size(); i++ )
-    {
-        rt_sectorCeilingExportable[ i ] =
-            RT_IsSectorExportable( &primaryLevel->sectors[ i ], true, animatedTexnums );
-        rt_sectorFloorExportable[ i ] =
-            RT_IsSectorExportable( &primaryLevel->sectors[ i ], false, animatedTexnums );
-    }
-
-    rt_wallExportable.resize( primaryLevel->segs.Size(), false );
-    for( uint32_t i = 0; i < primaryLevel->segs.Size(); i++ )
-    {
-        rt_wallExportable[ i ] = RT_IsWallExportable( &primaryLevel->segs[ i ], animatedTexnums );
-    }
-
-    rt_wallPegged.resize( primaryLevel->segs.Size(), false );
-    for( uint32_t i = 0; i < primaryLevel->segs.Size(); i++ )
-    {
-        rt_wallPegged[ i ] = RT_WallPeggedFlags( &primaryLevel->segs[ i ] );
-    }
-}
-
-bool RT_IsSectorExportable2( int sectornum, bool ceiling )
-{
-    if( sectornum >= 0 )
-    {
-        const auto& arr = ceiling ? rt_sectorCeilingExportable : rt_sectorFloorExportable;
-
-        if( sectornum < int( arr.size() ) )
-        {
-            return arr[ sectornum ];
-        }
-    }
-    return false;
-}
-
-bool RT_IsSectorExportable( const sector_t* sector, bool ceiling )
-{
-    if( sector )
-    {
-        return RT_IsSectorExportable2( sector->sectornum, ceiling );
-    }
-    return false;
-}
-
-bool RT_IsWallExportable( const seg_t* seg )
-{
-    if( seg && seg->segnum >= 0 )
-    {
-        const auto segnum = static_cast< uint32_t >( seg->segnum );
-
-        if( segnum < rt_wallExportable.size() )
-        {
-            return rt_wallExportable[ segnum ];
-        }
-    }
-    return false;
-}
-
-bool RT_IsWallNoMotionVectors( const seg_t* seg, side_t::ETexpart part )
-{
-    if( part == side_t::top || part == side_t::bottom )
-    {
-        if( seg && seg->segnum >= 0 && uint32_t( seg->segnum ) < rt_wallPegged.size() )
-        {
-            if( part == side_t::top )
-            {
-                // inverse logic, as top grows from bottom to up
-                return !( ( rt_wallPegged[ seg->segnum ] ) & RT_WALL_PEGGED_TOP );
-            }
-            else
-            {
-                return ( rt_wallPegged[ seg->segnum ] ) & RT_WALL_PEGGED_BOTTOM;
-            }
-        }
-    }
-    return true;
-}
-
-
-void RT_SpawnFluid( int             count,
-                    const FVector3& position,
-                    const FVector3& velocity,
-                    float           dispersionDegrees )
-{
-    if( count <= 0 || !cvar::rt_fluid_available || !cvar::rt_fluid )
-    {
-        return;
-    }
-    count = std::min( count, 10000 );
-
-    if( rt.rgSpawnFluid )
-    {
-        auto info = RgSpawnFluidInfo{
-            .sType                  = RG_STRUCTURE_TYPE_SPAWN_FLUID_INFO,
-            .pNext                  = nullptr,
-            .position               = { float( position.X ) * ONEGAMEUNIT_IN_METERS,
-                                        float( position.Y ) * ONEGAMEUNIT_IN_METERS,
-                                        float( position.Z ) * ONEGAMEUNIT_IN_METERS },
-            .radius                 = 0.05f,
-            .velocity               = { float( velocity.X ) * ONEGAMEUNIT_IN_METERS,
-                                        float( velocity.Y ) * ONEGAMEUNIT_IN_METERS,
-                                        float( velocity.Z ) * ONEGAMEUNIT_IN_METERS },
-            .dispersionVelocity     = 0.9f,
-            .dispersionAngleDegrees = dispersionDegrees,
-            .count                  = uint32_t( count ),
-        };
-
-        RgResult r = rt.rgSpawnFluid( &info );
-        RG_CHECK( r );
-    }
-}
-
-void RT_RegisterFullscreenImage( const char* texture )
-{
-    if( !texture || texture[ 0 ] == '\0' )
-    {
-        return;
-    }
-
-    constexpr uint8_t empty[] = { 0, 0, 0, 0 };
-
-    auto info = RgOriginalTextureInfo{
-        .sType        = RG_STRUCTURE_TYPE_ORIGINAL_TEXTURE_INFO,
-        .pNext        = nullptr,
-        .pTextureName = texture,
-        .pPixels      = empty,
-        .size         = { 1, 1 },
-        .filter       = RG_SAMPLER_FILTER_LINEAR,
-        .addressModeU = RG_SAMPLER_ADDRESS_MODE_CLAMP,
-        .addressModeV = RG_SAMPLER_ADDRESS_MODE_CLAMP,
-    };
-
-    RgResult r = rt.rgProvideOriginalTexture( &info );
-    RG_CHECK( r );
-}
-
-void RT_DeleteFullscreenImage( const char* texture )
-{
-    if( !texture || texture[ 0 ] == '\0' )
-    {
-        return;
-    }
-
-    RgResult r = rt.rgMarkOriginalTextureAsDeleted( texture );
-    RG_CHECK( r );
-}
-
-void RT_DrawFullscreenImage( const char* texture,
-                             float       opacity,
-                             FVector4    background_color,
-                             FVector4    foreground_color,
-                             float       splitef = 0,
-                             float       scale   = 1 )
-{
-    // samplers are hardcoded to 'repeat' in the wrapper + primitive.color is ignored
-    // so don't play anything :(
-    if( g_isremix )
-    {
-        return;
-    }
-
-    if( !texture || texture[ 0 ] == '\0' )
-    {
-        return;
-    }
-
-    if( opacity < 0.001f )
-    {
-        return;
-    }
-
-    static constexpr uint32_t indices[] = { 0, 1, 2, 2, 3, 0 };
-
-    static constexpr RgPrimitiveVertex verts_fullscreen[] = {
-        { .position = { -1, +1, 0 }, .texCoord = { 0, 1 }, .color = 0xFFFFFFFF },
-        { .position = { -1, -1, 0 }, .texCoord = { 0, 0 }, .color = 0xFFFFFFFF },
-        { .position = { +1, -1, 0 }, .texCoord = { 1, 0 }, .color = 0xFFFFFFFF },
-        { .position = { +1, +1, 0 }, .texCoord = { 1, 1 }, .color = 0xFFFFFFFF },
-    };
-
-    RgPrimitiveVertex verts_16by9[] = {
-        verts_fullscreen[ 0 ],
-        verts_fullscreen[ 1 ],
-        verts_fullscreen[ 2 ],
-        verts_fullscreen[ 3 ],
-    };
-
-    {
-        const RgExtent2D wnd = RT_GetCurrentWindowSize();
-
-        float xwin = ( float )wnd.width / ( float )wnd.height;
-        float ximg = 16.0f / 9.0f;
-
-        float tx, ty;
-        if( ximg < xwin )
-        {
-            tx = ximg / xwin;
-            ty = 1.0f;
-        }
-        else
-        {
-            tx = 1.0f;
-            ty = xwin / ximg;
-        }
-
-#define VectorSet2( ptr, x, y ) \
-    ( ptr )[ 0 ] = ( x );      \
-    ( ptr )[ 1 ] = ( y )
-
-        tx = ( 1 - 1 / tx ) / 2;
-        ty = ( 1 - 1 / ty ) / 2;
-
-        VectorSet2( verts_16by9[ 0 ].texCoord, tx, 1 - ty );
-        VectorSet2( verts_16by9[ 1 ].texCoord, tx, ty );
-        VectorSet2( verts_16by9[ 2 ].texCoord, 1 - tx, ty );
-        VectorSet2( verts_16by9[ 3 ].texCoord, 1 - tx, 1 - ty );
-    }
-
-    // scale
-    {
-        for( RgPrimitiveVertex& v : verts_16by9 )
-        {
-            v.texCoord[ 0 ] = ( ( v.texCoord[ 0 ] - 0.5f ) / scale ) + 0.5f;
-            v.texCoord[ 1 ] = ( ( v.texCoord[ 1 ] - 0.5f ) / scale ) + 0.5f;
-        }
-    }
-
-    constexpr static float viewproj[ 16 ] = {
-        1, 0, 0, 0, //
-        0, 1, 0, 0, //
-        0, 0, 1, 0, //
-        0, 0, 0, 1, //
-    };
-
-    auto l_drawcolor = []( const RgPrimitiveVertex( &verts )[ 4 ],
-                           RgColor4DPacked32        color ) {
-        auto ui = RgMeshPrimitiveSwapchainedEXT{
-            .sType           = RG_STRUCTURE_TYPE_MESH_PRIMITIVE_SWAPCHAINED_EXT,
-            .pNext           = nullptr,
-            .flags           = 0,
-            .pViewport       = nullptr,
-            .pView           = nullptr,
-            .pProjection     = nullptr,
-            .pViewProjection = viewproj,
-        };
-
-        auto prim = RgMeshPrimitiveInfo{
-            .sType                = RG_STRUCTURE_TYPE_MESH_PRIMITIVE_INFO,
-            .pNext                = &ui,
-            .flags                = RG_MESH_PRIMITIVE_TRANSLUCENT,
-            .primitiveIndexInMesh = 0,
-            .pVertices            = verts,
-            .vertexCount          = uint32_t( std::size( verts ) ),
-            .pIndices             = indices,
-            .indexCount           = std::size( indices ),
-            .pTextureName         = nullptr,
-            .textureFrame         = 0,
-            .color                = color,
-            .emissive             = 0,
-            .classicLight         = 1.0f,
-        };
-
-        RgResult r = rt.rgUploadMeshPrimitive( nullptr, &prim );
-        RG_CHECK( r );
-    };
-
-    // back color
-    if( background_color.W > 0 )
-    {
-        l_drawcolor( verts_fullscreen,
-                     rt.rgUtilPackColorFloat4D( background_color.X, //
-                                                background_color.Y,
-                                                background_color.Z,
-                                                background_color.W ) );
-    }
-
-    if( splitef > 0 )
-    {
-        RgPrimitiveVertex half[ 4 ];
-        static_assert( sizeof( half ) == sizeof( verts_fullscreen ) );
-
-        // left, rises top -> bottom
-        {
-            memcpy( half, verts_fullscreen, sizeof( verts_fullscreen ) );
-            VectorSet2( half[ 0 ].position, -1, +1 );
-            VectorSet2( half[ 1 ].position, -1, std::lerp( 1, -1, splitef ) );
-            VectorSet2( half[ 2 ].position, 0, std::lerp( 1, -1, splitef ) );
-            VectorSet2( half[ 3 ].position, 0, +1 );
-            l_drawcolor( half, RG_PACKED_COLOR_WHITE );
-        }
-        // right, rises bottom -> top
-        {
-            memcpy( half, verts_fullscreen, sizeof( verts_fullscreen ) );
-            VectorSet2( half[ 0 ].position, 0, std::lerp( -1, 1, splitef ) );
-            VectorSet2( half[ 1 ].position, 0, -1 );
-            VectorSet2( half[ 2 ].position, +1, -1 );
-            VectorSet2( half[ 3 ].position, +1, std::lerp( -1, 1, splitef ) );
-            l_drawcolor( half, RG_PACKED_COLOR_WHITE );
-        }
-    }
-
-    // image
-    {
-        auto ui = RgMeshPrimitiveSwapchainedEXT{
-            .sType           = RG_STRUCTURE_TYPE_MESH_PRIMITIVE_SWAPCHAINED_EXT,
-            .pNext           = nullptr,
-            .flags           = 0,
-            .pViewport       = nullptr,
-            .pView           = nullptr,
-            .pProjection     = nullptr,
-            .pViewProjection = viewproj,
-        };
-
-        auto prim = RgMeshPrimitiveInfo{
-            .sType                = RG_STRUCTURE_TYPE_MESH_PRIMITIVE_INFO,
-            .pNext                = &ui,
-            .flags                = RG_MESH_PRIMITIVE_TRANSLUCENT,
-            .primitiveIndexInMesh = 0,
-            .pVertices            = verts_16by9,
-            .vertexCount          = std::size( verts_16by9 ),
-            .pIndices             = indices,
-            .indexCount           = std::size( indices ),
-            .pTextureName         = texture,
-            .textureFrame         = 0,
-            .color                = rt.rgUtilPackColorFloat4D( 1.0f, 1.0f, 1.0f, opacity ),
-            .emissive             = 0,
-            .classicLight         = 1.0f,
-        };
-
-        RgResult r = rt.rgUploadMeshPrimitive( nullptr, &prim );
-        RG_CHECK( r );
-    }
-
-    // foreground color
-    if( foreground_color.W > 0 )
-    {
-        l_drawcolor( verts_fullscreen,
-                     rt.rgUtilPackColorFloat4D( foreground_color.X, //
-                                                foreground_color.Y,
-                                                foreground_color.Z,
-                                                foreground_color.W ) );
-    }
-
-    #undef VectorSet2
-}
-
-extern FSoundID T_FindSound( const char* name );
-
-static int         g_title_begintick{ -1 };
-static int         g_title_endtick{ -1 };
-static int         g_title_fadeouttics{ 0 };
-static std::string g_title_requested{};
-static std::string g_title_uploaded{};
-static bool        g_title_soundplayed{ false };
-
-void RT_StartTitleImage( const char* imagepath,
-                         int         begin_maptime,
-                         int         end_maptime,
-                         int         fadeout_tics )
-{
-    // samplers are hardcoded to 'repeat' in the wrapper + primitive.color is ignored
-    // so don't play anything :(
-    if( g_isremix )
-    {
-        return;
-    }
-
-    if( !imagepath || imagepath[ 0 ] == '\0' )
-    {
-        g_title_requested.clear();
-        g_title_endtick     = -1;
-        g_title_begintick   = -1;
-        g_title_fadeouttics = 0;
-        g_title_soundplayed = false;
-        return;
-    }
-
-    g_title_requested   = imagepath;
-    g_title_begintick   = begin_maptime;
-    g_title_endtick     = end_maptime;
-    g_title_fadeouttics = fadeout_tics;
-    g_title_soundplayed = false;
-}
-
-static void RT_DrawTitle()
-{
-    if( g_title_requested.empty() )
-    {
-        RT_ClearTitles();
-        return;
-    }
-
-    if( level.sectors.Size() <= 0 )
-    {
-        RT_ClearTitles();
-        return;
-    }
-
-    if( level.maptime >= g_title_endtick )
-    {
-        RT_ClearTitles();
-        return;
-    }
-
-    // upload texture
-    if( g_title_uploaded != g_title_requested )
-    {
-        if( !g_title_uploaded.empty() )
-        {
-            RT_DeleteFullscreenImage( g_title_uploaded.c_str() );
-        }
-
-        RT_RegisterFullscreenImage( g_title_requested.c_str() );
-        g_title_uploaded = g_title_requested;
-    }
-
-    if( g_title_begintick > 0 )
-    {
-        if( level.maptime < g_title_begintick )
-        {
-            return;
-        }
-    }
-
-    float alpha = 1.0f;
-    if( g_title_fadeouttics > 0 )
-    {
-        int ticksleft = g_title_endtick - level.maptime;
-        if( ticksleft < g_title_fadeouttics )
-        {
-            alpha = float( ticksleft ) / float( g_title_fadeouttics );
-
-            // gamma
-            alpha = alpha * alpha;
-        }
-    }
-
-    RT_DrawFullscreenImage( g_title_uploaded.c_str(), //
-                            alpha,
-                            { 0, 0, 0, alpha * 0.3f },
-                            { 0, 0, 0, 0 } );
-    
-    if( !g_title_soundplayed )
-    {
-        g_title_soundplayed = true;
-
-        if( soundEngine )
-        {
-            // HACKHACK
-            if( g_title_uploaded == "title/iconofsin" )
-            {
-                return;
-            }
-
-            FSoundID sound = T_FindSound( "sounds/cutscene/boom.ogg" );
-            soundEngine->StartSound(
-                SOURCE_None, nullptr, nullptr, CHAN_AUTO, CHANF_UI, sound, 1.0f, ATTN_NONE );
-        }
-    }
-}
-
-static void RT_ClearTitles()
-{
-    if( !g_title_uploaded.empty() )
-    {
-        RT_DeleteFullscreenImage( g_title_uploaded.c_str() );
-    }
-    g_title_requested.clear();
-    g_title_uploaded.clear();
-    g_title_begintick   = -1;
-    g_title_endtick     = -1;
-    g_title_fadeouttics = 0;
-    g_title_soundplayed = false;
-}
-
-extern bool rt_isdoom2;
-
-static void RT_InjectTitleIntoDoomMap( const char* mapname )
-{
-    if( !rt_isdoom2 )
-    {
-        return;
-    }
-    
-    if( !mapname || mapname[ 0 ] == '\0' )
-    {
-        return;
-    }
-
-    const char* titlename = nullptr;
-    {
-        if( stricmp( mapname, "map12" ) == 0 )
-        {
-            titlename = "title/ep2";
-        }
-        else if( stricmp( mapname, "map21" ) == 0 )
-        {
-            titlename = "title/ep3";
-        }
-    }
-
-    if( !titlename )
-    {
-        return;
-    }
-
-    constexpr int BEGIN_TICS    = int( 1.5f * TICRATE );
-    constexpr int DURATION_TICS = int( 5.0f * TICRATE );
-    constexpr int FADEOUT_TICS  = int( 3.0f * TICRATE );
-
-    RT_StartTitleImage( titlename, BEGIN_TICS, BEGIN_TICS + DURATION_TICS, FADEOUT_TICS );
-}
+// The map-export predicates moved to rt_export.cpp (their public face is
+// rt_helpers.h), and the title cards, fullscreen images and fluid spawner to
+// rt_titles.cpp.
