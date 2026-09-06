@@ -232,7 +232,9 @@ void RT_SkyPrimsEndFrame()
 }
 
 // Defined below (global namespace); RT_Print in the anonymous namespace needs it.
+#ifdef _WIN32
 extern std::atomic< HWND > g_msgbox_parent;
+#endif
 
 namespace
 {

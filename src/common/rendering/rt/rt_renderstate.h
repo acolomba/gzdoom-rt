@@ -15,7 +15,11 @@
 #include "rt_internal.h"
 #include "rt_buffers.h"
 
-#include "base_sysfb.h"
+#ifdef _WIN32
+    #include "base_sysfb.h"
+#else
+    #include "gl_sysfb.h"
+#endif
 #include "hw_renderstate.h"
 #include "hw_viewpointbuffer.h"
 #include "flatvertices.h"
@@ -64,7 +68,10 @@ public:
     void Draw2D() override;
 
     // RTGL1 has no frame-readback API; grab the presented HWND contents.
+#ifdef _WIN32
+    // Implemented in rt_main.cpp as an HWND capture; Linux keeps the base behavior.
     TArray< uint8_t > GetScreenshotBuffer( int& pitch, ESSType& color_type, float& gamma ) override;
+#endif
 
 public:
     void RT_MarkWasSky() { m_wassky = true; }

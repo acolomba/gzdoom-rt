@@ -1537,6 +1537,8 @@ void RT_UploadWallStripLights()
 //
 // Trace the sector perimeter instead. Works for both shapes: a ring of lights around a
 // small square ceiling panel, and a run of lights along a long corridor's edge.
+static constexpr uint32_t NoPlane = UINT32_MAX;
+
 void RT_UploadCeilingEdgeLamps()
 {
     if( !cvar::rt_ceiling_edge_lamps || !primaryLevel )
@@ -1604,7 +1606,6 @@ void RT_UploadCeilingEdgeLamps()
         // implicit coupling that breaks silently when a base moves.
         RtShaftSrc shaftSrc = RT_SHAFT_SRC_CEILING_EDGE;
     };
-    static constexpr uint32_t NoPlane = UINT32_MAX;
     std::vector< Cand > cand;
     // Faux panels and solo bulbs each collect into their own list and get their own cap,
     // then all three are merged. Appending them to `cand` would let invented/solo fixtures

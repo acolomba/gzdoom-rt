@@ -49,7 +49,9 @@
 #include "palentry.h"
 #include "vectors.h"
 
-#define RG_USE_SURFACE_WIN32
+#ifdef _WIN32
+    #define RG_USE_SURFACE_WIN32
+#endif
 #include <RTGL1/RTGL1.h>
 
 #include <algorithm>
